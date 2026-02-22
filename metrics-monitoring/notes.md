@@ -49,6 +49,9 @@
 - High availability — the monitoring system is most critical exactly when things are going wrong
 - Cardinality control — unbounded label combinations can silently kill the system
 
+> **✅ Key insight a staff engineer shows here:**
+> Don't just list requirements mechanically — connect the scale math to design consequences ("write-heavy and read-bursty means we separate these paths") and proactively name cardinality as a non-obvious but critical constraint.
+
 ---
 
 ## Step 2: Core Entities & Data Modeling
@@ -78,6 +81,11 @@ Dashboard   → collection of panels backed by metric queries (drives the read p
 500,000 × 200 × 10 × 5 = **5 billion** theoretical series
 
 Each series has overhead in the storage engine — its own index entry, in-memory tracking, and write buffer. At that scale the database degrades silently: write throughput drops, memory spikes, queries slow down. This is why cardinality is a first-class design concern, not an afterthought."
+
+> **✅ What makes this staff-level:**
+> - Connects entities to the scaling problem (series → cardinality)
+> - Doesn't just list entities — explains why each one matters to the design
+> - Proactively foreshadows the cardinality deep dive without getting lost in it yet
 
 ---
 
@@ -139,6 +147,12 @@ Each series has overhead in the storage engine — its own index entry, in-memor
 **🎤 Interviewer:** "What's the trade-off of agents vs. servers pushing directly?"
 
 **👨‍💻 Candidate:** "The main trade-off is operational complexity — you now have a daemon to deploy, version, configure, and monitor on 500K servers. But the benefits outweigh it: local buffering (metrics survive brief network outages), local aggregation (compute percentiles at the edge), and 100x reduction in central ingestion load. Every production-grade monitoring system — Datadog, Prometheus, OTEL — uses this pattern for exactly these reasons."
+
+> **✅ What makes this staff-level:**
+> - Starts with the naive approach and explains why it fails before proposing the real solution
+> - Clearly separates write, read, and alert paths with different design rationale for each
+> - Justifies every component with trade-offs, not just "I'd use Kafka because it's good"
+> - Connects decisions back to the scale numbers established in Step 1
 
 ---
 
@@ -235,6 +249,12 @@ GET    /v1/alerts/active              → currently firing alerts
 **🎤 Interviewer:** "How would you handle auth and rate limiting on the ingestion API?"
 
 **👨‍💻 Candidate:** "Each agent authenticates with an API key scoped to a tenant, passed as a header. An API gateway in front handles auth validation and rate limiting per key — two purposes: protect the system from runaway agents, and enforce fair usage in a multi-tenant setup. I'd put this in the gateway, not the ingestion service itself, so the ingestion service stays focused purely on throughput."
+
+> **✅ What makes this staff-level:**
+> - Justifies every design decision — protobuf vs. JSON, 202 vs. 200, GET vs. POST
+> - Thinks about who the client is and designs the API accordingly (agent vs. human)
+> - Proactively raises auth, rate limiting, and caching as first-class concerns
+> - Connects API design back to the system's scaling constraints
 
 ---
 
@@ -342,6 +362,12 @@ Reliability: since alert events are durably in Kafka, the Notification Service u
 
 **👨‍💻 Candidate:** "The wrong answer is to use the same monitoring system to monitor itself — if it's down, so is your monitoring of it. I'd use a completely separate, minimal meta-monitoring stack — possibly a managed service like AWS CloudWatch or a simple external uptime checker. It watches for: ingestion lag in Kafka, alert evaluator heartbeats, notification service throughput, and TSDB write success rates. Notifies through an out-of-band channel, not through the system being monitored."
 
+> **✅ What makes this staff-level:**
+> - Starts simple (polling) and justifies when to add complexity (Flink only for real-time tier)
+> - Treats notification delivery as a separate reliability problem from alert evaluation
+> - Proactively covers deduplication, grouping, silencing, escalation — the real-world messiness
+> - Addresses the "monitoring the monitor" meta-problem with a concrete answer
+
 ---
 
 ### ⚡ Deep Dive 3: High Availability & Failure Handling
@@ -389,6 +415,12 @@ Reliability: since alert events are durably in Kafka, the Notification Service u
 **🎤 Interviewer:** "Where do you draw the line? How late is too late?"
 
 **👨‍💻 Candidate:** "I'd configure a maximum out-of-order tolerance window — e.g., 2 hours. Data older than that is rejected at ingestion with a specific error code so the agent knows not to retry. This prevents unbounded rollup recomputation and protects against a misbehaving agent suddenly dumping days of buffered data. The 2-hour threshold is configurable per tenant — a high-value customer might get a longer window."
+
+> **✅ What makes this staff-level:**
+> - Thinks about every layer independently with specific failure modes and mitigations
+> - Addresses the catch-up problem quantitatively — not just "Kafka buffers it" but "here's the math on why we need 50% headroom"
+> - Has a graceful degradation strategy — the system never fully goes dark
+> - Handles out-of-order data with nuance — distinguishes slightly late vs. very late vs. out-of-order and proposes appropriate solutions for each
 
 ---
 
@@ -462,6 +494,13 @@ Bloom filters have no false negatives — existing series always pass. False pos
 **🎤 Interviewer:** "What about multi-tenancy — if one team causes a cardinality explosion, should it affect others?"
 
 **👨‍💻 Candidate:** "Absolutely not. Per-tenant cardinality budgets enforced at ingestion — one team hitting their budget hits their own cap, not a global one. In the TSDB, large tenants get physically isolated clusters. Strict per-tenant query quotas prevent one tenant's expensive query from starving another's. This is one of the hardest parts of building a SaaS monitoring platform — Datadog charges by custom metrics volume precisely because cardinality is so operationally expensive."
+
+> **✅ What makes this staff-level:**
+> - Explains cardinality from first principles — not just "it's bad" but why, with math
+> - Covers detection, prevention, and recovery — the full lifecycle
+> - Goes deep on the Bloom filter optimization — shows algorithmic thinking
+> - Raises multi-tenancy isolation proactively — a real-world concern most candidates miss
+> - Connects to business reality — Datadog's pricing model is a direct consequence of this problem
 
 ---
 
