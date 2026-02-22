@@ -1,4 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "elevenlabs>=1.0.0",
+#   "pydub>=0.25.0",
+# ]
+# ///
 """
 Generate interview audio from notes.md using ElevenLabs TTS.
 
@@ -6,9 +13,9 @@ Parses the 🎤 Interviewer / 👨‍💻 Candidate dialogue format and generate
 a single MP3 with different voices for each speaker.
 
 Usage:
-    python scripts/generate_audio.py <path/to/notes.md>
-    python scripts/generate_audio.py google-docs/notes.md
-    python scripts/generate_audio.py google-docs/notes.md --output audio/google-docs.mp3
+    uv run scripts/generate_audio.py <path/to/notes.md>
+    uv run scripts/generate_audio.py google-docs/notes.md
+    uv run scripts/generate_audio.py google-docs/notes.md --output audio/google-docs.mp3
 
 Environment variables:
     ELEVENLABS_API_KEY       required
@@ -16,8 +23,8 @@ Environment variables:
     CANDIDATE_VOICE_ID       optional (default: Adam)
 
 Requirements:
-    pip install -r scripts/requirements.txt
-    Also requires ffmpeg: https://ffmpeg.org/download.html
+    uv handles Python dependencies automatically via inline script metadata.
+    Also requires ffmpeg: brew install ffmpeg  (or: sudo apt install ffmpeg)
 """
 
 import argparse
@@ -193,7 +200,7 @@ def main():
     try:
         from elevenlabs.client import ElevenLabs
     except ImportError:
-        print("Error: elevenlabs not installed. Run: pip install -r scripts/requirements.txt", file=sys.stderr)
+        print("Error: elevenlabs not installed. Run: uv run scripts/generate_audio.py", file=sys.stderr)
         sys.exit(1)
 
     client = ElevenLabs(api_key=api_key)
@@ -261,7 +268,7 @@ def main():
     try:
         combined = combine_clips(clips, pause_ms=args.pause)
     except ImportError:
-        print("Error: pydub not installed. Run: pip install -r scripts/requirements.txt", file=sys.stderr)
+        print("Error: pydub not installed. Run: uv run scripts/generate_audio.py", file=sys.stderr)
         print("Also ensure ffmpeg is installed: https://ffmpeg.org/download.html", file=sys.stderr)
         sys.exit(1)
 
