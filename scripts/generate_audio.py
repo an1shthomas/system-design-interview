@@ -4,6 +4,7 @@
 # dependencies = [
 #   "elevenlabs>=1.0.0",
 #   "pydub>=0.25.0",
+#   "audioop-lts>=0.2.1",
 # ]
 # ///
 """
@@ -267,9 +268,11 @@ def main():
     print(f"\nCombining {len(clips)} clips…")
     try:
         combined = combine_clips(clips, pause_ms=args.pause)
-    except ImportError:
-        print("Error: pydub not installed. Run: uv run scripts/generate_audio.py", file=sys.stderr)
-        print("Also ensure ffmpeg is installed: https://ffmpeg.org/download.html", file=sys.stderr)
+    except FileNotFoundError:
+        print("Error: ffmpeg not found. Install it with: sudo pacman -S ffmpeg", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error combining audio: {e}", file=sys.stderr)
         sys.exit(1)
 
     output_path.write_bytes(combined)
