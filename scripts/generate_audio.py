@@ -44,8 +44,8 @@ from pathlib import Path
 # Voice defaults
 # ---------------------------------------------------------------------------
 
-KOKORO_INTERVIEWER_VOICE    = "af_bella"             # Female, American English, grade A-
-KOKORO_CANDIDATE_VOICE      = "am_michael"           # Male,   American English, grade B
+KOKORO_INTERVIEWER_VOICE    = "af_jessica"             # Female, American English, grade A-
+KOKORO_CANDIDATE_VOICE      = "am_adam"           # Male,   American English, grade B
 KOKORO_SAMPLE_RATE          = 24000
 
 ELEVENLABS_INTERVIEWER_VOICE = "21m00Tcm4TlvDq8ikWAM"  # Rachel
@@ -275,7 +275,7 @@ def main():
         if args.output:
             output_path = Path(args.output)
         else:
-            output_path = notes_path.parent / f"{notes_path.parent.name}.wav"
+            output_path = notes_path.parent / f"{notes_path.parent.name}-kokoro.wav"
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         kokoro_generate(notes_path, output_path, iv, cv, args.pause)
@@ -300,7 +300,7 @@ def main():
         if args.output:
             output_path = Path(args.output)
         else:
-            output_path = notes_path.parent / f"{notes_path.parent.name}.mp3"
+            output_path = notes_path.parent / f"{notes_path.parent.name}-elevenlabs.mp3"
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         elevenlabs_generate(notes_path, output_path, iv, cv, args.pause, client, args.model)
