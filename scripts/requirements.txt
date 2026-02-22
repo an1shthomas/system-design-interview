@@ -3,4 +3,3 @@ soundfile>=0.12.1
 numpy>=1.24.0
 elevenlabs>=1.0.0
 pydub>=0.25.0
-audioop-lts>=0.2.1  # backport of audioop removed in Python 3.13+
