@@ -2,46 +2,59 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "elevenlabs>=1.0.0",
-#   "pydub>=0.25.0",
-#   "audioop-lts>=0.2.1",
+#   "kokoro>=0.9.4",
+#   "soundfile>=0.12.1",
+#   "numpy>=1.24.0",
 # ]
 # ///
 """
-Generate interview audio from notes.md using ElevenLabs TTS.
+Generate interview audio from notes.md using Kokoro TTS (local, no API key).
 
 Parses the 🎤 Interviewer / 👨‍💻 Candidate dialogue format and generates
-a single MP3 with different voices for each speaker.
+a single WAV file with different voices for each speaker.
 
 Usage:
     uv run scripts/generate_audio.py <path/to/notes.md>
     uv run scripts/generate_audio.py google-docs/notes.md
-    uv run scripts/generate_audio.py google-docs/notes.md --output audio/google-docs.mp3
-
-Environment variables:
-    ELEVENLABS_API_KEY       required
-    INTERVIEWER_VOICE_ID     optional (default: Rachel)
-    CANDIDATE_VOICE_ID       optional (default: Adam)
+    uv run scripts/generate_audio.py google-docs/notes.md --output audio/google-docs.wav
 
 Requirements:
     uv handles Python dependencies automatically via inline script metadata.
-    Also requires ffmpeg: brew install ffmpeg  (or: sudo apt install ffmpeg)
+    Also requires espeak-ng: sudo pacman -S espeak-ng
+
+Voices (American English):
+    Interviewer: af_bella  (female, grade A-)
+    Candidate:   am_michael (male,   grade B)
+
+    Override via env vars: INTERVIEWER_VOICE and CANDIDATE_VOICE
+    List all voices: --list-voices
 """
 
 import argparse
-import io
 import os
 import re
 import sys
-import time
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Default ElevenLabs voice IDs — change these or override via env vars
-# Browse voices at: https://elevenlabs.io/voice-library
+# Default Kokoro voice IDs
+# Full list: https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md
 # ---------------------------------------------------------------------------
-DEFAULT_INTERVIEWER_VOICE = "21m00Tcm4TlvDq8ikWAM"  # Rachel — professional female
-DEFAULT_CANDIDATE_VOICE   = "pNInz6obpgDQGcFmaJgB"  # Adam   — professional male
+DEFAULT_INTERVIEWER_VOICE = "af_bella"   # Female, American English, grade A-
+DEFAULT_CANDIDATE_VOICE   = "am_michael" # Male,   American English, grade B
+
+SAMPLE_RATE = 24000  # Kokoro outputs at 24kHz
+
+ALL_VOICES = [
+    # American English
+    "af_heart", "af_bella", "af_nicole", "af_aoede", "af_kore", "af_sarah",
+    "af_alloy", "af_nova", "af_sky", "af_jessica", "af_river",
+    "am_michael", "am_fenrir", "am_puck", "am_echo", "am_eric",
+    "am_liam", "am_onyx", "am_adam",
+    # British English
+    "bf_emma", "bf_alice", "bf_isabella", "bf_lily",
+    "bm_george", "bm_fable", "bm_daniel", "bm_lewis",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +149,7 @@ def clean_text(text: str) -> str:
     text = re.sub(r"^\d+\.\s+", "", text, flags=re.MULTILINE)
     # Underscores used for emphasis
     text = re.sub(r"_(.+?)_", r"\1", text)
-    # Curly quotes → straight (TTS handles these fine, but let's normalise)
+    # Curly quotes → straight
     text = text.replace("\u201c", '"').replace("\u201d", '"')
     text = text.replace("\u2018", "'").replace("\u2019", "'")
     # Collapse whitespace
@@ -145,38 +158,25 @@ def clean_text(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# ElevenLabs TTS
+# Kokoro TTS
 # ---------------------------------------------------------------------------
 
-def tts(client, voice_id: str, text: str, model_id: str = "eleven_turbo_v2_5") -> bytes:
-    """Call ElevenLabs TTS and return raw MP3 bytes."""
-    audio_generator = client.text_to_speech.convert(
-        voice_id=voice_id,
-        text=text,
-        model_id=model_id,
-        output_format="mp3_44100_128",
-    )
-    return b"".join(audio_generator)
+def tts(pipeline, voice: str, text: str):
+    """Generate audio for text using Kokoro. Returns a numpy float32 array."""
+    import numpy as np
+    chunks = [audio for _, _, audio in pipeline(text, voice=voice)]
+    return np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
 
 
-# ---------------------------------------------------------------------------
-# Audio combining
-# ---------------------------------------------------------------------------
-
-def combine_clips(clips: list[bytes], pause_ms: int = 600) -> bytes:
-    """Combine MP3 clips with a short silence between each."""
-    from pydub import AudioSegment  # imported here so missing pydub gives a clear error
-
-    silence = AudioSegment.silent(duration=pause_ms)
-    combined = AudioSegment.empty()
-
-    for clip_bytes in clips:
-        segment = AudioSegment.from_mp3(io.BytesIO(clip_bytes))
-        combined += segment + silence
-
-    buf = io.BytesIO()
-    combined.export(buf, format="mp3")
-    return buf.getvalue()
+def combine_clips(clips, pause_ms: int = 600):
+    """Concatenate numpy audio arrays with silence between each clip."""
+    import numpy as np
+    silence = np.zeros(int(SAMPLE_RATE * pause_ms / 1000), dtype=np.float32)
+    parts = []
+    for clip in clips:
+        parts.append(clip)
+        parts.append(silence)
+    return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -184,40 +184,26 @@ def combine_clips(clips: list[bytes], pause_ms: int = 600) -> bytes:
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate interview audio from notes.md")
+    parser = argparse.ArgumentParser(description="Generate interview audio from notes.md using Kokoro TTS")
     parser.add_argument("notes", help="Path to notes.md file")
-    parser.add_argument("--output", "-o", help="Output MP3 path (default: <notes_dir>/<dirname>.mp3)")
+    parser.add_argument("--output", "-o", help="Output WAV path (default: <notes_dir>/<dirname>.wav)")
     parser.add_argument("--pause", type=int, default=600, help="Pause between speakers in ms (default: 600)")
-    parser.add_argument("--model", default="eleven_turbo_v2_5", help="ElevenLabs model ID")
     parser.add_argument("--list-voices", action="store_true", help="Print available voices and exit")
     args = parser.parse_args()
 
-    # --- API key ---
-    api_key = os.environ.get("ELEVENLABS_API_KEY")
-    if not api_key:
-        print("Error: ELEVENLABS_API_KEY environment variable not set.", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        from elevenlabs.client import ElevenLabs
-    except ImportError:
-        print("Error: elevenlabs not installed. Run: uv run scripts/generate_audio.py", file=sys.stderr)
-        sys.exit(1)
-
-    client = ElevenLabs(api_key=api_key)
-
-    # --- List voices mode ---
     if args.list_voices:
-        voices = client.voices.get_all()
-        print(f"{'Name':<30} {'Voice ID'}")
-        print("-" * 60)
-        for v in sorted(voices.voices, key=lambda x: x.name):
-            print(f"{v.name:<30} {v.voice_id}")
+        print("Available Kokoro voices (American English):")
+        print("  Female: af_heart af_bella af_nicole af_aoede af_kore af_sarah af_alloy af_nova af_sky")
+        print("  Male:   am_michael am_fenrir am_puck am_echo am_eric am_liam am_onyx am_adam")
+        print("\nBritish English:")
+        print("  Female: bf_emma bf_alice bf_isabella bf_lily")
+        print("  Male:   bm_george bm_fable bm_daniel bm_lewis")
+        print("\nFull quality grades: https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md")
         return
 
-    # --- Voice IDs ---
-    interviewer_voice = os.environ.get("INTERVIEWER_VOICE_ID", DEFAULT_INTERVIEWER_VOICE)
-    candidate_voice   = os.environ.get("CANDIDATE_VOICE_ID",   DEFAULT_CANDIDATE_VOICE)
+    # --- Voice selection ---
+    interviewer_voice = os.environ.get("INTERVIEWER_VOICE", DEFAULT_INTERVIEWER_VOICE)
+    candidate_voice   = os.environ.get("CANDIDATE_VOICE",   DEFAULT_CANDIDATE_VOICE)
 
     # --- Parse notes.md ---
     notes_path = Path(args.notes)
@@ -238,27 +224,34 @@ def main():
     if args.output:
         output_path = Path(args.output)
     else:
-        output_path = notes_path.parent / f"{notes_path.parent.name}.mp3"
+        output_path = notes_path.parent / f"{notes_path.parent.name}.wav"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # --- Load Kokoro (downloads model on first run, ~300MB) ---
+    print("Loading Kokoro model…")
+    try:
+        from kokoro import KPipeline
+    except ImportError:
+        print("Error: kokoro not installed. Run: uv run scripts/generate_audio.py", file=sys.stderr)
+        sys.exit(1)
+
+    pipeline = KPipeline(lang_code='a')  # 'a' = American English
+    print(f"Interviewer voice: {interviewer_voice}  |  Candidate voice: {candidate_voice}\n")
+
     # --- Generate audio ---
-    clips: list[bytes] = []
+    import numpy as np
+    clips = []
     for i, (speaker, text) in enumerate(segments, 1):
-        voice_id = interviewer_voice if speaker == "interviewer" else candidate_voice
+        voice = interviewer_voice if speaker == "interviewer" else candidate_voice
         label = "Interviewer" if speaker == "interviewer" else "Candidate"
-        preview = text[:60] + ("…" if len(text) > 60 else "")
+        preview = text[:70] + ("…" if len(text) > 70 else "")
         print(f"[{i}/{len(segments)}] {label}: {preview}")
 
         try:
-            audio_bytes = tts(client, voice_id, text, model_id=args.model)
-            clips.append(audio_bytes)
+            audio = tts(pipeline, voice, text)
+            clips.append(audio)
         except Exception as e:
             print(f"  Warning: TTS failed for segment {i}: {e}", file=sys.stderr)
-            continue
-
-        # Small delay to stay within rate limits
-        if i < len(segments):
-            time.sleep(0.3)
 
     if not clips:
         print("Error: No audio clips generated.", file=sys.stderr)
@@ -266,17 +259,12 @@ def main():
 
     # --- Combine and save ---
     print(f"\nCombining {len(clips)} clips…")
-    try:
-        combined = combine_clips(clips, pause_ms=args.pause)
-    except FileNotFoundError:
-        print("Error: ffmpeg not found. Install it with: sudo pacman -S ffmpeg", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error combining audio: {e}", file=sys.stderr)
-        sys.exit(1)
+    combined = combine_clips(clips, pause_ms=args.pause)
 
-    output_path.write_bytes(combined)
-    print(f"Saved: {output_path}")
+    import soundfile as sf
+    sf.write(str(output_path), combined, SAMPLE_RATE)
+    duration_min = len(combined) / SAMPLE_RATE / 60
+    print(f"Saved: {output_path}  ({duration_min:.1f} min)")
 
 
 if __name__ == "__main__":
