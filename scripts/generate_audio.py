@@ -3,6 +3,7 @@
 # requires-python = ">=3.11,<3.14"
 # dependencies = [
 #   "kokoro>=0.9.4",
+#   "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0.tar.gz",
 #   "soundfile>=0.12.1",
 #   "numpy>=1.24.0",
 #   "elevenlabs>=1.0.0",
