@@ -25,6 +25,7 @@ Example: `metrics-monitoring/`
 - **🎤 Interviewer** asks the question
 - **👨‍💻 Candidate** answers with reasoning and trade-offs
 - Interviewer follow-up questions probe deeper
-- Each step covers: Requirements & Scale → Core Entities → Architecture → API Design → Deep Dives → Trade-offs
+- Each step ends with a `✅ What makes this staff-level:` callout explaining what separates a strong answer from an average one
+- Each step covers: Requirements & Scale → Core Entities → Architecture → API Design → Deep Dives → Trade-offs → Core Insight
 
 When creating a new question, follow this format and structure.
