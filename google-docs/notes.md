@@ -13,18 +13,42 @@
 👨‍💻 **Candidate:** "Before jumping in, let me ask a few questions to scope the problem correctly — this one has a lot of potential surface area."
 
 **Functional scope:**
-- "Are we supporting rich text formatting — bold, italics, images, tables — or can we assume plain text for now?" *(Interviewer: assume simple text editor)*
-- "Do we need to support document permissions — who can view vs. edit?" *(Out of scope)*
-- "What about document versioning — the ability to revert to previous states?" *(Out of scope for now, but good to flag as a potential deep dive)*
-- "Are we supporting comments and suggestions, or just direct edits?" *(Just direct edits)*
-- "Do we need offline editing — users making changes without a network connection?" *(Out of scope, but flag it)*
+
+👨‍💻 **Candidate:** "Are we supporting rich text formatting — bold, italics, images, tables — or can we assume plain text for now?"
+
+🎤 **Interviewer:** "Assume a simple text editor."
+
+👨‍💻 **Candidate:** "Do we need to support document permissions — who can view vs. edit?"
+
+🎤 **Interviewer:** "Out of scope."
+
+👨‍💻 **Candidate:** "What about document versioning — the ability to revert to previous states?"
+
+🎤 **Interviewer:** "Out of scope for now, but good to flag as a potential deep dive."
+
+👨‍💻 **Candidate:** "Are we supporting comments and suggestions, or just direct edits?"
+
+🎤 **Interviewer:** "Just direct edits."
+
+👨‍💻 **Candidate:** "Do we need offline editing — users making changes without a network connection?"
+
+🎤 **Interviewer:** "Out of scope, but flag it."
 
 **Collaboration scope:**
-- "How many users can concurrently edit the same document?" *(Interviewer: max 100 concurrent editors per document)*
-- "Do we need to show other users' cursor positions and presence?" *(Yes)*
+
+👨‍💻 **Candidate:** "How many users can concurrently edit the same document?"
+
+🎤 **Interviewer:** "Max 100 concurrent editors per document."
+
+👨‍💻 **Candidate:** "Do we need to show other users' cursor positions and presence?"
+
+🎤 **Interviewer:** "Yes."
 
 **Scale:**
-- "What's the target scale — millions of users, billions of documents?" *(Yes, millions of concurrent users across billions of documents)*
+
+👨‍💻 **Candidate:** "What's the target scale — millions of users, billions of documents?"
+
+🎤 **Interviewer:** "Yes, millions of concurrent users across billions of documents."
 
 **Back-of-the-envelope (candidate does this out loud):**
 
