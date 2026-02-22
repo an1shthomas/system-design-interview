@@ -1,0 +1,946 @@
+Got it — I've read through the Google Docs system design problem. Same format as before: I'll play both the interviewer and a staff engineer, going step by step and pausing for your "go ahead" before each step.
+Here's the structure we'll follow:
+
+Clarifying Requirements (Functional & Non-Functional)
+Core Entities & Data Modeling
+API Design
+High-Level Architecture (write path, read path, cursor/presence)
+Deep Dives:
+
+Collaborative editing: OT vs. CRDTs
+Scaling WebSocket connections
+Storage compaction & snapshots
+
+
+Wrap-up & Trade-offs
+
+
+This problem is notably different from the Metrics Monitoring one. The core challenge here isn't raw throughput — it's consistency under concurrent edits and stateful real-time connections at scale. These are harder to reason about and more conceptually demanding, which is why it's rated hard.
+Ready to start with Step 1: Clarifying Requirements?
+Just say "go ahead"!go aheadStep 1: Clarifying Requirements
+
+🎤 Interviewer:
+"Design a collaborative document editor like Google Docs. Where would you like to start?"
+👨‍💻 Staff Engineer (candidate):
+"Before jumping in, let me ask a few questions to scope the problem correctly — this one has a lot of potential surface area."
+Functional scope:
+
+"Are we supporting rich text formatting — bold, italics, images, tables — or can we assume plain text for now?" (Interviewer: assume simple text editor)
+"Do we need to support document permissions — who can view vs. edit?" (Out of scope)
+"What about document versioning — the ability to revert to previous states?" (Out of scope for now, but good to flag as a potential deep dive)
+"Are we supporting comments and suggestions, or just direct edits?" (Just direct edits)
+"Do we need offline editing — users making changes without a network connection?" (Out of scope, but flag it)
+Collaboration scope:
+"How many users can concurrently edit the same document?" (Interviewer: max 100 concurrent editors per document)
+"Do we need to show other users' cursor positions and presence?" (Yes)
+Scale:
+"What's the target scale — millions of users, billions of documents?" (Yes, millions of concurrent users across billions of documents)
+
+
+📐 Back-of-the-envelope (candidate does this out loud):
+"Let me quickly size the problem."
+
+Millions of concurrent users, each connected via a persistent WebSocket
+A fast typist makes ~5 keystrokes/second → ~5 edit operations/second per user
+At 1M concurrent editors: ~5M edit operations/second globally
+But these are spread across billions of documents — the key insight is that contention is per-document, not global. With max 100 editors per document, the per-document write rate is at most 500 ops/second — very manageable.
+Each operation is small: ~50-100 bytes (operation type, position, character, timestamp, user ID)
+Cursor updates are even more frequent but tiny (~20 bytes each)
+"This shapes our design significantly. The global scale challenge is about managing millions of persistent WebSocket connections across a distributed fleet of servers. The per-document challenge is about consistency — ensuring 100 concurrent editors all converge on the same document state. These are two separate problems and I'll tackle them separately."
+
+
+✅ Key non-functional requirements the candidate calls out:
+
+Eventual consistency — all users must eventually see the same document state
+Low latency — edits should feel real-time, under 100ms round trip
+Durability — documents must survive server restarts (no data loss)
+High availability — the system must stay up even during failures
+Scale — millions of concurrent WebSocket connections, billions of documents
+
+
+🎤 Interviewer follow-up:
+"You mentioned the 100 concurrent editor limit is interesting. Why does that matter to your design?"
+👨‍💻 Candidate:
+"It's a huge simplification. It means I don't need to worry about a single document generating massive throughput — 100 editors at 5 ops/second is 500 ops/second, which a single server can handle easily. More importantly, it means I can route all editors of the same document to a single server without that server becoming a hotspot. This makes consistency much simpler — one server has the authoritative view of the document and can serialize all edits. If we had 10,000 concurrent editors per document, we'd need a distributed consensus mechanism, which is a much harder problem. Google Docs made this exact design choice in production — beyond a certain number of users, new joiners are downgraded to read-only. That's a hint about their architecture."
+✅ What makes this staff-level:
+
+Immediately identifies the two distinct challenges — connection scaling vs. per-document consistency
+Recognizes that the 100-editor cap is a deliberate architectural constraint, not just a product decision
+Connects the back-of-the-envelope math to design consequences — per-document contention is manageable, global connection scaling is the hard part
+Proactively flags out-of-scope items (offline mode, versioning) as potential deep dives
+
+
+Ready for Step 2: Core Entities & Data Modeling? Just say "go ahead"!go aheadStep 2: Core Entities & Data Modeling
+
+🎤 Interviewer:
+"Walk me through the core entities in this system before we get into the architecture."
+👨‍💻 Staff Engineer (candidate):
+"Let me identify the key nouns and think carefully about what data we need to store and what's ephemeral — that distinction will drive some important design decisions."
+The Entities:
+1. Document
+The top-level entity. Stores metadata about the document — not the content itself.
+Document {
+  docId:      UUID        -- primary key
+  title:      string
+  ownerId:    userId
+  createdAt:  timestamp
+  updatedAt:  timestamp
+  versionId:  UUID        -- points to current compacted version (important for deep dive)
+}
+"Notice I'm separating document metadata from document content. The metadata is small and queried frequently — it lives in Postgres. The actual content is represented as a sequence of operations — that lives in a separate store optimized for append-heavy writes."
+2. Operation (Edit)
+The atomic unit of change. Every keystroke, deletion, or formatting change is an operation.
+Operation {
+  opId:        UUID
+  docId:       UUID        -- which document
+  userId:      UUID        -- who made the edit
+  versionId:   UUID        -- which document version this op belongs to
+  type:        enum        -- INSERT | DELETE
+  position:    integer     -- where in the document
+  content:     string      -- the character(s) inserted (null for DELETE)
+  timestamp:   timestamp   -- set by the server, not the client
+}
+"A few important design decisions here. Timestamp is set by the server, not the client — this gives us a total ordering of operations which is essential for Operational Transformation. The versionId ties operations to a specific compacted snapshot — I'll explain why in the deep dive on storage. And operations are append-only — we never update or delete an operation record, only add new ones."
+3. Cursor / Presence
+The position of a user's cursor and their presence in the document.
+Cursor {
+  docId:     UUID
+  userId:    UUID
+  position:  integer     -- character offset in document
+  color:     string      -- UI color assigned to this user
+  name:      string      -- display name
+  updatedAt: timestamp
+}
+"Here's a critical observation: cursor and presence data is ephemeral. It only matters while a user is connected. When they disconnect, their cursor disappears. We don't need to persist this to a database — it lives in the Document Service's memory, associated with the WebSocket connection. This is a different storage tier from the document itself."
+4. Editor (User)
+A user interacting with a document. For this design we'll assume users are already authenticated — we just need their userId.
+📊 Storage Mapping:
+EntityStorageWhyDocument metadataPostgresRelational, flexible queries, low volumeOperations (edits)CassandraAppend-only, high write throughput, partition by docIdCursor / PresenceIn-memory (Document Service)Ephemeral, tied to WebSocket connection lifetime
+
+🎤 Interviewer follow-up:
+"Why Cassandra for operations? Why not Postgres?"
+👨‍💻 Candidate:
+"Operations are append-only and partitioned naturally by docId. We'll query them as 'give me all operations for docId X after version Y, ordered by timestamp' — a simple range scan on a partition key. Cassandra is purpose-built for this: it partitions by docId so all operations for a document are co-located, orders by timestamp within a partition, and handles high append throughput without the write amplification that B-tree indexes cause in Postgres. We'd partition by (docId, versionId) and cluster by timestamp — that query pattern maps perfectly to Cassandra's data model."
+🎤 Interviewer follow-up:
+"You said cursor data is ephemeral. What happens when a new user joins a document where others are already editing?"
+👨‍💻 Candidate:
+"Great question. When a new user connects via WebSocket, the Document Service has all active cursors in memory — one per connected user. It immediately sends the new user a snapshot of all current cursor positions as part of the connection handshake, before any new edits arrive. Since all editors of the same document are connected to the same Document Service instance, this is a simple in-memory read — no database query needed. This is one of the key reasons we want all editors of the same document co-located on the same server."
+✅ What makes this staff-level:
+
+Separates metadata from content — not one monolithic document record
+Critically distinguishes persistent data (operations) from ephemeral data (cursors) — and chooses appropriate storage for each
+Justifies Cassandra over Postgres with a concrete query pattern argument
+Server-assigned timestamps — a subtle but important correctness detail for OT
+The versionId field foreshadows the compaction deep dive without getting lost in it yet
+
+
+Ready for Step 3: API Design? Just say "go ahead"!
+
+Step 3: API Design
+
+🎤 Interviewer:
+"Let's define the API. What interfaces does this system expose?"
+👨‍💻 Staff Engineer (candidate):
+"This system has two distinct communication patterns that require different protocols — and choosing the right one for each is itself an important design decision."
+"For document management — creating, listing documents — standard REST over HTTP is fine. These are low-frequency, stateless operations. But for collaborative editing, we need bidirectional, real-time, persistent communication. HTTP request-response doesn't work here — the server needs to push updates to clients without the client polling. WebSockets are the right choice: they give us a persistent full-duplex channel with low overhead per message."
+1. 📄 Document Management API (REST)
+Create a document:
+POST /v1/docs
+{
+  "title": "My Document"
+}
+→ 201 Created
+{
+  "docId": "doc_abc123",
+  "title": "My Document",
+  "createdAt": 1640000000
+}
+Get document metadata:
+GET /v1/docs/{docId}
+→ 200 OK
+{
+  "docId": "doc_abc123",
+  "title": "My Document",
+  "versionId": "ver_xyz789",
+  "updatedAt": 1640000000
+}
+"Note that GET /docs/{docId} returns metadata only — not the document content. The actual content is loaded over the WebSocket connection when the user opens the editor. This keeps the REST API lightweight."
+2. ✏️ Collaborative Editing API (WebSocket)
+Connection:
+WS /v1/docs/{docId}
+Headers: Authorization: Bearer <token>
+"The client first makes an HTTP request to establish the WebSocket connection, passing the docId and auth token. The server authenticates, looks up the document, and upgrades to a WebSocket. On successful connection, the server immediately sends the client the current document state — the latest compacted snapshot plus any subsequent operations."
+Messages the client SENDS to server:
+// Insert characters
+{
+  "type": "insert",
+  "opId": "op_client_123",    ← client-generated, for dedup
+  "position": 5,
+  "content": ", world",
+  "clientTimestamp": 1640000000
+}
+// Delete characters
+{
+  "type": "delete",
+  "opId": "op_client_124",
+  "position": 5,
+  "length": 3                  ← how many characters to delete
+}
+// Update cursor position
+{
+  "type": "updateCursor",
+  "position": 7
+}
+Messages the client RECEIVES from server:
+// Initial document state on connection
+{
+  "type": "init",
+  "versionId": "ver_xyz789",
+  "content": "Hello",           ← current document text
+  "cursors": [                  ← other users' current cursors
+    { "userId": "u1", "position": 3, "color": "#FF5733", "name": "Alice" }
+  ]
+}
+// A transformed operation from another editor
+{
+  "type": "operation",
+  "opId": "op_server_456",
+  "userId": "u1",               ← who made the edit
+  "operationType": "insert",
+  "position": 5,                ← server-transformed position
+  "content": ", world",
+  "serverTimestamp": 1640000001  ← authoritative ordering
+}
+// Acknowledgment of client's own operation
+{
+  "type": "ack",
+  "opId": "op_client_123",      ← echoes client's opId
+  "serverTimestamp": 1640000001  ← confirms server ordering
+}
+// Another user's cursor moved
+{
+  "type": "cursorUpdate",
+  "userId": "u1",
+  "position": 7
+}
+// A user joined or left
+{
+  "type": "presenceUpdate",
+  "userId": "u1",
+  "status": "joined"            ← or "left"
+}
+
+🎤 Interviewer follow-up:
+"Why does the client send its own opId? And why does the server echo it back in the ack?"
+👨‍💻 Candidate:
+"Two reasons. First, idempotency — if the client sends an operation but the network drops before receiving the ack, it will retry. The server uses the client-generated opId to detect and deduplicate the retry rather than applying the same edit twice. Second, optimistic UI — the client applies its own edit immediately to the local document without waiting for the server (otherwise the editor would feel laggy at 100ms+ round trip). When the ack arrives with the server timestamp, the client knows the operation has been officially ordered and can reconcile its local state. If the ack never arrives, the client knows to retry."
+🎤 Interviewer follow-up:
+"Why not use Server-Sent Events (SSE) instead of WebSockets?"
+👨‍💻 Candidate:
+"SSE is unidirectional — server to client only. For a collaborative editor, clients need to send edits to the server as well. You could technically combine SSE for receiving with HTTP POST for sending, but that's two separate connections per user, more complex state management, and higher overhead per operation. WebSockets give us a single persistent full-duplex channel — simpler, lower latency, and the right tool for this use case. SSE makes more sense for read-heavy, one-way push scenarios like live sports scores or notification feeds."
+✅ What makes this staff-level:
+
+Justifies the protocol choice (WebSocket vs REST vs SSE) with concrete reasoning
+Designs the init message carefully — document state + all cursor positions sent on connection
+Client-generated opId for idempotency and optimistic UI — a subtle but production-critical detail
+Server timestamps for authoritative ordering — connects back to the OT requirement from entities
+Separates ack messages from broadcast messages — client needs to know its own op was accepted
+
+
+Ready for Step 4: High-Level Architecture? This is where we wire everything together — the write path, read path, and presence system. Just say "go ahead"!
+
+Step 4: High-Level Architecture
+
+🎤 Interviewer:
+"Walk me through the high-level architecture. How does the system work end to end?"
+👨‍💻 Staff Engineer (candidate):
+"I'll build this up incrementally — starting with document creation, then the collaborative editing write path, then the read path, and finally cursor/presence. I'll flag scaling concerns as I go and save them for deep dives."
+🏗️ Component Overview
+Before tracing the flows, let me name the components:
+
+API Gateway — handles auth, routing, rate limiting
+Document Metadata Service — CRUD for document metadata, backed by Postgres
+Document Service — the stateful core: manages WebSocket connections, applies OT, broadcasts updates. One instance owns all connections for a given document.
+Document Operations DB — Cassandra, stores the append-only log of operations partitioned by docId
+Document Metadata DB — Postgres, stores document metadata
+
+
+1. 📄 Creating a Document
+"Simple and fast. The client sends POST /v1/docs to the API Gateway, which routes to the Document Metadata Service. It generates a docId, writes a record to Postgres, and returns the docId. No WebSocket involved yet."
+Client → API Gateway → Document Metadata Service → Postgres
+                                ↓
+                         { docId: "doc_abc123" }
+"This is a standard horizontally-scaled stateless CRUD service. I won't dwell here — it's table stakes. The interesting parts are ahead."
+2. ✏️ Collaborative Editing — Write Path
+"This is the core of the problem. Let me trace what happens when a user makes an edit."
+Step 1 — Connection:
+The client opens a WebSocket to the Document Service responsible for docId. (I'll defer how we route to the right server to the deep dive — for now assume we find the right server.)
+Step 2 — Document Load:
+On connection, the Document Service:
+
+Fetches the current versionId from Postgres (Document Metadata)
+Loads the compacted snapshot + all subsequent operations from Cassandra for that docId + versionId
+Reconstructs the current document state in memory
+Sends the init message to the client with full document content + active cursors
+Step 3 — Receiving an Edit:
+User A types a character. The client sends an insert operation over the WebSocket.
+
+Client A --[insert op]--> Document Service
+The Document Service:
+
+Assigns a server timestamp — this is the authoritative ordering for OT
+Applies Operational Transformation — transforms the incoming op against any concurrent ops it has already seen and applied (more on this in the deep dive)
+Writes the transformed op to Cassandra — durability guaranteed before ack
+Sends ack to Client A — confirms the op was accepted and its server-assigned order
+Broadcasts the transformed op to all other connected clients (Client B, C, etc.)
+
+Document Service → Cassandra (write op)
+                → Client A (ack)
+                → Client B, C... (broadcast transformed op)
+Step 4 — Client receives broadcast:
+Client B receives the transformed operation from the server and applies it to its local document. Since Client B may also have local unacknowledged operations, it applies OT on its side too — transforming the incoming server op against its own pending local ops before applying. This ensures convergence regardless of network ordering.
+🎤 Interviewer:
+"Why write to Cassandra before sending the ack? Why not ack immediately and write asynchronously?"
+👨‍💻 Candidate:
+"Durability. If we ack the client and then crash before writing to Cassandra, that operation is lost forever — the client thinks it was saved, but it wasn't. The user could close the browser, the document would reload from Cassandra, and their edit is silently gone. That's a catastrophic user experience. By writing to Cassandra first, we guarantee the operation survives any server crash. The latency cost is real — Cassandra writes typically take 1-5ms — but it's necessary. This is essentially 'write-ahead logging' applied to collaborative editing."
+3. 📖 Read Path — Viewing Changes in Real-Time
+"The read path is simple precisely because of our design choice to co-locate all editors on the same Document Service instance."
+When Client A's edit is processed:
+
+The Document Service has all connected WebSocket handles in memory
+It simply iterates over connected clients for that docId and sends the transformed op to each one
+No pub/sub, no message broker, no cross-server communication needed
+"This is the key payoff of the co-location design. Broadcasting to 100 concurrent editors is just 100 in-memory WebSocket writes — trivially fast, no network hops."
+When a user first loads a document that's already being edited:
+Connection handshake fetches latest state from Cassandra
+Sends init message with reconstructed document + active cursors
+From that point, they receive live broadcasts like everyone else
+
+
+4. 🖱️ Cursor & Presence
+"Cursor and presence are deliberately kept separate from document operations — they have different characteristics."
+When a user moves their cursor:
+
+Client sends updateCursor message with new position over WebSocket
+Document Service updates its in-memory cursor map for that docId
+Document Service broadcasts a cursorUpdate message to all other connected clients
+When a user disconnects:
+Document Service detects the WebSocket hangup
+Removes that user's cursor from the in-memory map
+Broadcasts a presenceUpdate with status: "left" to remaining editors
+"None of this touches Cassandra or Postgres. Cursor state is entirely in-memory because it's ephemeral — it only exists for the duration of the connection. This keeps the cursor update path extremely fast: a cursor move is just an in-memory write + a few WebSocket broadcasts."
+
+
+🗺️ Full Architecture Picture
+[Client A] ←──WebSocket──→ ┐
+[Client B] ←──WebSocket──→ ├─ [Document Service]  ←→ [Cassandra: Operations DB]
+[Client C] ←──WebSocket──→ ┘         ↕
+                                [Postgres: Metadata DB]
+                                      ↕
+[Client D] ──REST──→ [API Gateway] → [Document Metadata Service]
+                                      ↕
+                                [Postgres: Metadata DB]
+"For now this is a single Document Service instance handling all connections for all documents. In the deep dive I'll address how we scale this horizontally across millions of connections while maintaining the co-location guarantee."
+🎤 Interviewer follow-up:
+"What happens if the Document Service crashes while editors are connected?"
+👨‍💻 Candidate:
+"Two things happen. First, all connected WebSocket clients detect the connection drop and enter a reconnect loop with exponential backoff — this should be built into the client. Second, they reconnect to a new Document Service instance. Because all operations were durably written to Cassandra before being acked, the new instance can reconstruct the full document state by replaying operations from Cassandra. Any operations the client had sent but not yet received acks for get retried — the client-generated opId ensures they're deduplicated on the server side. The in-memory cursor state is lost but clients re-broadcast their cursor positions on reconnect as part of the init sequence. So we lose ephemeral state (cursors momentarily) but never persistent state (document content)."
+✅ What makes this staff-level:
+
+Builds up incrementally — document creation → write path → read path → presence, each with clear rationale
+Write-to-Cassandra before ack — explicitly connects this to durability and the write-ahead log pattern
+Co-location as a first-class design choice — not an afterthought, but the reason the read path is simple
+Clearly separates ephemeral cursor state from durable operation state
+Handles crash recovery with a concrete answer: replay from Cassandra + client retry with opId dedup
+
+
+Ready for Step 5: Deep Dives? We'll cover:
+
+OT vs. CRDTs (the consistency mechanism in depth)
+Scaling WebSocket connections to millions of users
+Storage compaction & snapshots
+Just say "go ahead"!
+
+Step 5: Deep Dives
+
+🔄 Deep Dive 1: Collaborative Editing — OT vs. CRDTs
+
+🎤 Interviewer:
+"You mentioned Operational Transformation. Walk me through why it's needed and how it actually works. And how does it compare to CRDTs?"
+👨‍💻 Candidate:
+"Let me build up to OT by showing why naive approaches fail, then explain OT and CRDTs as two different philosophies for solving the same problem."
+❌ Naive Approach 1: Send Full Document Snapshots
+"The simplest idea: every time a user makes an edit, send the entire document to the server, which stores it."
+Why it fails:
+
+Extremely inefficient — a 50KB document sends 50KB on every keystroke
+Lost updates: If User A and User B both edit and send their snapshots simultaneously, whoever arrives last wins — the other's changes are silently overwritten. For a collaborative editor, this is catastrophic.
+
+
+❌ Naive Approach 2: Send Operations (No Transformation)
+"Better — send just the delta: INSERT(position=5, content=', world') or DELETE(position=6)."
+Why it still fails — a concrete example:
+Document starts as: Hello!
+Position:  0 1 2 3 4 5
+Character: H e l l o !
+
+User A inserts , world after position 4 → sends INSERT(5, ", world")
+User B deletes ! at position 5 → sends DELETE(5)
+Both send at the same time. Server applies User A's op first:
+
+Hello, world!
+0123456789012  ← ! is now at position 12, not 5
+Now User B's DELETE(5) arrives — it deletes , instead of !:
+Hello world!  ← wrong! comma deleted, ! survived
+"The problem: User B's operation was based on the document state they saw locally. When concurrent operations arrive out of order, positional references become stale. This is the core consistency problem."
+✅ Good Solution: Operational Transformation (OT)
+Core idea: Transform each incoming operation based on operations that have already been applied, so its intent is preserved regardless of ordering.
+Same example with OT:
+User B's DELETE(5) arrives after User A's INSERT(5, ", world") has already been applied.
+The server knows:
+
+User B's op was based on a state where ! was at position 5
+User A's INSERT added 7 characters before position 5+
+Therefore, ! is now at position 5 + 7 = 12
+The server transforms User B's op: DELETE(5) → DELETE(12)
+Apply transformed op:
+
+Hello, world  ← correct! ! deleted, comma preserved
+How OT works at the server:
+The Document Service maintains an ordered log of all operations applied to the document. When a new operation arrives:
+
+Determine which operations the client had already seen (via the client's last-known version)
+Transform the incoming op against all ops applied since then
+Apply the transformed op and append to the log
+Broadcast the transformed op to other clients
+OT also happens on the client:
+When Client B receives a server broadcast of User A's op, it must also transform it against any local unacknowledged ops before applying. This ensures local optimistic updates stay consistent with incoming server ops.
+
+Server: [Ea, Eb_transformed]
+Client A sees: Ea → Eb_transformed  ✅
+Client B sees: Eb (local) → Ea_transformed  ✅
+Both converge to same document ✅
+OT Trade-offs:
+
+✅ Low memory — no need to keep tombstones, just the operation log
+✅ Efficient — works well for text specifically
+✅ Battle-tested — Google Docs, Notion, and most production editors use it
+❌ Requires a central server to establish authoritative op ordering — can't be fully peer-to-peer
+❌ Tricky to implement correctly — transformation functions must handle all op combinations
+
+
+✅ Alternative: Conflict-free Replicated Data Types (CRDTs)
+Core idea: Instead of transforming operations, design the data structure so all operations are commutative — they produce the same result regardless of order.
+How CRDTs handle positions:
+Instead of integer positions (which shift when characters are inserted/deleted), CRDTs assign each character a globally unique, stable fractional position — like a real number between 0 and 1 that never changes.
+"Same example with CRDTs:"
+Document: Hello!
+
+🌐 Deep Dive 2: Scaling WebSocket Connections to Millions of Users
+
+🎤 Interviewer:
+"Your current design has all editors of a document on a single Document Service instance. How do you scale this to millions of concurrent WebSocket connections?"
+👨‍💻 Staff Engineer (candidate):
+"This is the hardest scaling challenge in this system. Let me explain why it's tricky before proposing solutions."
+🔴 Why This Is Hard
+"WebSocket connections are stateful and long-lived. Unlike HTTP where any server can handle any request, a WebSocket connection is pinned to a specific server for its entire lifetime. This creates two tensions:"
+
+Connection scaling: A single server can handle ~50,000-100,000 concurrent WebSocket connections (limited by file descriptors, memory per connection, and CPU for OT). At 1M concurrent editors we need at least 10-20 servers.
+Co-location requirement: For OT to work correctly and for broadcast to be simple, all editors of the same document must be on the same server instance. We can't have User A on Server 1 and User B on Server 2 editing the same document — they'd each apply OT independently with no shared ordering, causing divergence.
+"So we need horizontal scaling, but with a constraint: same document → same server. This is a classic consistent routing problem."
+
+
+❌ Bad Solution: Simple Round-Robin Load Balancing
+"A standard load balancer distributes connections round-robin across servers. User A might land on Server 1, User B on Server 2. Now we have two servers with no shared document state, applying OT independently — classic split-brain. The two users will see diverging documents. This fundamentally breaks correctness."
+✅ Good Solution: Consistent Hash Ring
+Approach:
+Route each document to a deterministic server by hashing the docId. All editors of the same document always hash to the same server — co-location guaranteed.
+How it works:
+
+Document Service instances join a consistent hash ring, each owning a range of hash values
+When a client wants to connect for doc_abc123, it first makes an HTTP request to any server
+That server computes hash(doc_abc123) → determines which server owns that hash range
+If it's not the current server, it responds with a redirect to the correct server's address
+The client reconnects directly to the correct server and upgrades to WebSocket
+ZooKeeper for ring coordination:
+
+
+Each Document Service instance registers itself in ZooKeeper on startup
+ZooKeeper maintains the current ring configuration — which server owns which hash range
+All servers watch ZooKeeper for ring changes (new servers joining, failed servers leaving)
+Clients don't talk to ZooKeeper directly — only servers do
+
+Client → any Server → check ZooKeeper hash ring
+                    → redirect to correct Server
+                    → WebSocket connection established
+Why consistent hashing specifically?
+"When we add or remove a server, consistent hashing minimizes disruption. A standard hash (docId % N) would remap ~50% of all documents when N changes. Consistent hashing remaps only ~1/N documents — only those whose hash range now belongs to the new server. At our scale, remapping fewer connections during scaling events is critical."
+🎤 Interviewer:
+"What happens when a server fails or a new server is added? How do you handle the connections that need to move?"
+👨‍💻 Candidate:
+Server failure:
+
+ZooKeeper detects the failed server via its heartbeat mechanism (session timeout, typically 3-10 seconds)
+ZooKeeper removes the server from the ring and notifies all remaining servers of the updated ring
+The failed server's hash ranges are redistributed to neighboring servers in the ring
+All clients that were connected to the failed server detect the WebSocket drop and enter reconnect loop
+On reconnect, they hit any live server, which redirects them to the new owner of their docId's hash range
+The new owner loads the document state from Cassandra and resumes
+"The key insight: because all operations were written to Cassandra before being acked, no data is lost. The reconnect is seamless from a data perspective — users see a brief 'reconnecting...' indicator at worst."
+Adding a new server (scaling up):
+New server joins the ring and registers with ZooKeeper
+It takes ownership of a portion of the hash range from its neighbors
+Documents in that range need to migrate — affected clients are disconnected and redirected to the new server
+During the transition, the system must handle a brief period where two servers think they own the same range — managed by ZooKeeper's linearizable writes ensuring only one server is authoritative at any time
+"This is the hairiest part of the design. During ring transitions we need to be careful about the 'double write' problem — an operation arriving during migration could be processed by both the old and new owner. We handle this with a migration protocol: the old server stops accepting new ops for migrating documents and drains in-flight ops to Cassandra before handing off. The new server only starts accepting connections after confirming the handoff is complete via a ZooKeeper transaction."
+
+
+🎤 Interviewer:
+"That's complex. Is there a simpler alternative for scaling WebSocket connections?"
+👨‍💻 Candidate:
+"Yes — and it's worth discussing the trade-off. An alternative is to decouple WebSocket connection management from document processing using a pub/sub layer."
+Alternative: WebSocket Gateway + Redis Pub/Sub
+[Client A] ──WebSocket──→ [WS Gateway 1] ──subscribe(docId)──→ [Redis Pub/Sub]
+[Client B] ──WebSocket──→ [WS Gateway 2] ──subscribe(docId)──→ [Redis Pub/Sub]
+                                                                       ↑
+                                              [Document Service] ──publish(docId, op)──┘
+
+WebSocket Gateways are stateless edge servers that just hold connections. Any gateway can accept any client — no routing needed.
+Document Service is stateless too — it processes ops and publishes results to a Redis channel keyed by docId.
+Redis Pub/Sub fans out the published op to all gateways that have subscribers for that docId. Each gateway forwards it to its connected clients.
+Why this is simpler:
+No consistent hashing, no ZooKeeper ring management
+WebSocket gateways are fully stateless — easy to scale up/down
+No connection migration during scaling events
+Why we still choose consistent hashing for this problem:
+"The pub/sub approach breaks our OT requirement. OT needs a single authoritative server to establish a total ordering of operations for each document. If two Document Service instances both process ops for the same document concurrently, they'd produce different orderings and clients would diverge. You'd need a distributed lock or a consensus mechanism (like Raft) to serialize ops — which adds back the complexity we tried to avoid. The pub/sub approach works well for simpler broadcast problems — like live comments or presence — where there's no ordering dependency between messages. For OT-based collaborative editing, we need the centralized ordering that consistent hashing gives us."
+
+
+🎤 Interviewer:
+"What about memory? With millions of documents, can you keep them all in memory?"
+👨‍💻 Candidate:
+"No — and we shouldn't try. Most documents are inactive at any given time. We only keep active documents in memory — those with at least one connected editor. When the last editor disconnects, we evict the document from memory (after compaction, which I'll cover in the next deep dive). When a new editor connects to an inactive document, we load it fresh from Cassandra."
+"Let's size this. If we have 1M concurrent editors spread across at most 100 editors per document, we have at least 10,000 active documents at any time. If the average active document is 50KB in memory (reconstructed text + operation metadata), that's 500MB of active document state per server — very manageable. The key is aggressive eviction of idle documents."
+✅ What makes this staff-level:
+
+Names the exact tension — horizontal scaling vs. co-location requirement — before proposing solutions
+Explains why consistent hashing over simple hashing — minimizes remapping on topology changes
+Addresses failure and scaling events with a concrete migration protocol
+Honestly evaluates the pub/sub alternative — knows when it works and why it doesn't fit here
+Sizes the memory problem — doesn't just say "evict inactive documents" but does the math
+
+
+Ready for Deep Dive 3: Storage Compaction & Snapshots?
+We'll cover:
+
+Why storing every operation forever is unsustainable
+Online vs. offline compaction strategies
+The versionId mechanism for safe atomic compaction
+Just say "go ahead"!
+
+💾 Deep Dive 3: Storage Compaction & Snapshots
+
+🎤 Interviewer:
+"You're storing every edit operation forever in Cassandra. A popular document could have millions of operations. What problems does this cause and how do you solve it?"
+👨‍💻 Staff Engineer (candidate):
+"Great question — this is a problem that grows silently and bites you in production. Let me explain the failure modes before proposing solutions."
+🔴 Why Unbounded Operation Storage Is a Problem
+Problem 1: Cassandra storage growth
+At 5M ops/second globally, each op ~100 bytes:
+
+5M × 100 bytes = 500MB/second of raw operation data
+Per day: ~43TB of operation logs
+Even with Cassandra's compression, this is unsustainable long-term. And unlike the metrics system where old data ages out naturally, we can't just delete old operations — they're needed to reconstruct the document.
+Problem 2: Document load time
+When a new editor connects to a document with 1 million operations, the Document Service must:
+
+
+Fetch all 1M operations from Cassandra
+Replay them sequentially to reconstruct the current document state
+Send the reconstructed document to the client
+"At 1M ops, even at 10,000 ops/second replay speed, that's 100 seconds of load time. Completely unacceptable. A user opening a document should see content in under a second."
+Problem 3: Memory pressure
+Keeping a million operations in memory per active document, across thousands of active documents, quickly exhausts the Document Service's heap.
+
+
+💡 The Solution: Operation Compaction (Snapshotting)
+"The core idea: periodically collapse many operations into a single snapshot operation representing the document's full current state. Instead of storing 1M individual edits, store one INSERT(0, "full document text") operation. New operations after the snapshot are stored normally."
+"This is directly analogous to database checkpointing in WAL-based systems like Postgres. The WAL (write-ahead log) records every change, but periodically a checkpoint collapses the WAL into a consistent snapshot. Recovery starts from the last checkpoint, not the beginning of time."
+The versionId mechanism:
+This is why the versionId field exists in both the Document metadata and Operation records:
+Document { docId, versionId: "ver_002", ... }
+Operations:
+(docId, versionId="ver_001", t=1) INSERT(0, "Hello")   ← old version
+(docId, versionId="ver_001", t=2) INSERT(5, ", world") ← old version
+(docId, versionId="ver_002", t=3) INSERT(0, "Hello, world")  ← compacted snapshot
+(docId, versionId="ver_002", t=4) INSERT(12, "!")      ← new ops after snapshot
+When loading a document, the Document Service:
+
+Reads the current versionId from Postgres
+Fetches only operations with that versionId from Cassandra
+Applies them in order to reconstruct the document
+Old operations under previous versionIds can be safely deleted from Cassandra — they're no longer referenced.
+"The versionId is the atomic switch between old and new compacted state. As long as flipping it is atomic, we never serve a partially compacted document."
+
+
+✅ Good Solution: Offline Compaction Service
+Approach:
+A separate Compaction Service runs as a background job. It:
+
+Identifies documents that are large (many ops), haven't been compacted recently, and are currently inactive (no active WebSocket connections — we check with the Document Service)
+Reads all operations for the current versionId from Cassandra
+Replays them to reconstruct the document text
+Writes a single INSERT(0, fullText) operation under a new versionId
+Atomically flips the versionId in Postgres via a conditional update (compare-and-swap)
+Schedules deletion of old operations under the previous versionId
+
+Compaction Service:
+  → Read ops (versionId="ver_001") from Cassandra
+  → Replay to get "Hello, world"
+  → Write INSERT(0, "Hello, world") under versionId="ver_002"
+  → UPDATE docs SET versionId="ver_002" WHERE docId=X AND versionId="ver_001"
+  → Delete ops WHERE docId=X AND versionId="ver_001"
+The compare-and-swap is critical:
+"The WHERE versionId="ver_001" condition ensures we only flip if nothing else has changed the versionId concurrently. If a Document Service instance loaded the document and started a compaction at the same time, one of them will lose the CAS and retry. This prevents two compactions running simultaneously on the same document — a correctness bug that would cause data loss."
+Challenges:
+
+We need to verify the document is truly inactive before compacting — otherwise we're racing with live edits
+The Compaction Service itself is a source of heavy Cassandra reads — needs rate limiting and throttling to avoid impacting live document writes
+Deletion of old ops should be deferred and batched — immediate deletion after flip risks a race where a client loaded the old versionId but hasn't finished replaying yet
+
+
+✅ Great Solution: Online Compaction by the Document Service
+Approach:
+"The offline Compaction Service has a fundamental awkwardness: it needs to coordinate with the Document Service to check if a document is active. What if we eliminate that coordination by having the Document Service do compaction itself?"
+When does it compact?
+
+When the last editor disconnects from a document, the Document Service already knows the document is now idle
+At that exact moment, it has the full document state in memory — no need to replay from Cassandra
+It triggers compaction in a separate lower-priority process so it doesn't block new connections
+The flow:
+
+Last client disconnects
+        ↓
+Document Service (async, low priority):
+  → Serialize current in-memory document state → fullText
+  → Write INSERT(0, fullText) to Cassandra under new versionId
+  → CAS flip versionId in Postgres
+  → Schedule old op deletion
+  → Evict document from memory
+Why this is better:
+
+No coordination needed — the Document Service inherently knows when a document is idle. No need to poll the Document Service from an external Compaction Service.
+Already have the state in memory — no need to replay from Cassandra. We just serialize what's already reconstructed.
+Natural timing — compacting when the last editor leaves means documents are always in a compact state when they're inactive. The next editor to open the document loads instantly.
+Simpler architecture — one fewer service to deploy and operate.
+The low-priority process detail:
+"We offload compaction to a separate OS process with lower CPU scheduling priority (via nice on Linux). This prevents a large document compaction from consuming CPU that a simultaneously connecting new editor needs. The worst case is a new editor opens the document while compaction is still running — we just serve from the in-memory state directly and let compaction finish in the background."
+Edge cases to handle:
+
+
+Server crash during compaction: The old versionId is still in Postgres — the next load replays from Cassandra as normal. Compaction simply didn't happen — correctness preserved, just no storage savings.
+New editor connects while compaction is running: Document Service serves from in-memory state, compaction continues independently. When compaction completes and flips versionId, it doesn't affect already-connected editors — they're already in sync.
+Very large documents: For a 10MB document, serialization and Cassandra write might take a few seconds. This is fine since it's async and low-priority.
+
+
+🎤 Interviewer:
+"How would you extend this to support document versioning — letting users revert to earlier versions?"
+👨‍💻 Candidate:
+"Elegant extension — and our current design almost supports it for free. Instead of deleting old versionIds after compaction, we keep them. Each versionId becomes a named checkpoint with a timestamp. The Document Metadata DB stores a history of versionIds:"
+DocumentVersions {
+  docId:       UUID
+  versionId:   UUID
+  createdAt:   timestamp
+  label:       string    ← optional user-assigned label e.g. "Before major rewrite"
+  compactedOp: UUID      ← points to the snapshot operation in Cassandra
+}
+"To revert to a previous version, we replay from that version's compacted snapshot. To view a historical version, we load that versionId's ops from Cassandra. The only cost is storage — we're keeping old operation logs rather than deleting them. We could apply tiered retention: keep full granularity for 30 days, then keep only hourly snapshots, then daily snapshots for older history. This is exactly how Google Docs version history works."
+🎤 Interviewer:
+"What about memory optimization? The Document Service keeps active documents in memory. How do you bound that?"
+👨‍💻 Candidate:
+"Three levers:"
+
+Aggressive eviction on last disconnect — as discussed, we evict immediately after compaction. No idle documents in memory.
+LRU eviction for documents with no connections but recently accessed — if a document had a viewer (read-only) disconnect recently, we keep it in memory briefly in case they return, then evict on an LRU basis.
+Operation log trimming in memory — once an operation has been acknowledged and broadcast to all connected clients, it only needs to stay in memory for OT transformation against new incoming ops. We can bound the in-memory operation history to a rolling window — say, the last 1,000 ops — since very old ops are unlikely to be needed for transformation against new incoming edits.
+"With these three, the memory footprint per active document is bounded to roughly: document text size + last N operations buffer + cursor map. For a typical document that's well under 1MB, giving us room for thousands of active documents per server."
+
+
+✅ What makes this staff-level:
+
+Sizes the problem — 43TB/day and 100-second load times make the urgency concrete
+Connects to WAL/checkpointing — shows understanding of how databases solve the same problem
+The versionId mechanism — a clean, atomic solution with no distributed locks needed
+Compares offline vs. online compaction — and picks online with clear reasoning
+Handles edge cases — crash during compaction, new editor during compaction
+Extends to versioning naturally — shows the design was forward-thinking
+
+
+Ready for the final Step 6: Wrap-up & Trade-offs?
+We'll tie everything together, summarize the full design, highlight deliberate trade-offs, and discuss what we'd do with more time — just like a real interview close. Just say "go ahead"!
+
+Step 6: Wrap-up & Trade-offs
+
+🎤 Interviewer:
+"We're coming up on time. Summarize your design, the key trade-offs, and what you'd revisit given more time."
+👨‍💻 Staff Engineer (candidate):
+"Let me zoom out and give you the full picture, then walk through the deliberate trade-offs."
+🗺️ Full System Summary
+The system has three distinct concerns, each with its own design:
+1. Document Management (stateless, simple):
+
+Client → API Gateway → Document Metadata Service → Postgres
+Standard horizontally-scaled CRUD. Creates documents, stores metadata, maintains the current versionId pointer. Deliberately kept separate from the collaborative editing layer.
+2. Collaborative Editing (stateful, complex):
+Client A, B, C ←──WebSocket──→ Document Service (owns docId via consistent hash ring + ZooKeeper) ←→ Cassandra (operation log)
+The Document Service is the authoritative OT server for each document. It:
+
+
+Holds all active WebSocket connections for a document
+Assigns server timestamps to establish operation ordering
+Applies OT to incoming ops and broadcasts transformed ops to all connected clients
+Applies OT on the client side too for optimistic local updates
+Keeps cursor/presence state in memory, evicted on disconnect
+3. Storage Lifecycle:
+
+
+Document Service (on last disconnect) → compacts ops → writes snapshot to Cassandra → CAS flips versionId in Postgres → evicts from memory
+Operations are append-only in Cassandra, partitioned by (docId, versionId), clustered by timestamp. Online compaction triggers when the last editor leaves — collapsing the operation log into a single snapshot operation under a new versionId.
+
+
+🗺️ Full Architecture Diagram
+[Client A] ←─WebSocket─→ ┐
+[Client B] ←─WebSocket─→ ├─ [Document Service] ←→ [Cassandra: Operations DB]
+[Client C] ←─WebSocket─→ ┘        ↑↓
+                              [ZooKeeper]
+                              (hash ring)
+                                   ↑↓
+                         [Document Service 2]
+                         [Document Service 3...]
+[Client] ──REST──→ [API Gateway] → [Document Metadata Service]
+                                         ↓
+                                    [Postgres: Metadata DB]
+                                    (docId, versionId, title...)
+
+⚖️ Key Trade-offs Made
+1. OT over CRDTs
+
+Chose: Operational Transformation
+Trade-off: Requires central server for op ordering vs. CRDT's peer-to-peer flexibility
+Rationale: We already have a centralized Document Service — OT's constraint is our architecture. Lower memory overhead (no tombstones), better suited for linear text, and battle-tested in production systems (Google Docs, Notion). CRDTs would be the right choice for offline-first or P2P scenarios.
+2. Consistent hash ring over pub/sub gateway
+Chose: Consistent hashing with ZooKeeper for WebSocket routing
+Trade-off: Operational complexity (ring management, migration protocol) vs. simplicity of stateless gateways + Redis pub/sub
+Rationale: OT correctness requires a single authoritative server per document. Pub/sub would require distributed locking to serialize ops — trading one complexity for another. Consistent hashing gives us co-location as a first-class property. The pub/sub approach is excellent for problems without ordering dependencies (live comments, presence-only systems).
+3. Online compaction over offline Compaction Service
+Chose: Document Service compacts on last-editor-disconnect
+Trade-off: Slightly increases complexity of the Document Service vs. a dedicated compaction microservice
+Rationale: Eliminates cross-service coordination, leverages already-in-memory document state, and guarantees documents are always compact when inactive. The offline service would need to poll for activity status — inherently racy. The online approach is both simpler and more correct.
+4. Cassandra over Postgres for operations
+Chose: Cassandra for the operation log
+Trade-off: Only row-level transactions vs. Postgres's full ACID transactions
+Rationale: The operation log is append-only, partitioned by docId, with simple range queries by timestamp — a perfect Cassandra use case. The lack of multi-row transactions is mitigated by the versionId CAS mechanism in Postgres for compaction atomicity. We use each database for what it's best at.
+5. Server-assigned timestamps over client timestamps
+Chose: Document Service assigns timestamps to all operations
+Trade-off: Can't use client-perceived time, slight additional latency for each op
+Rationale: Client clocks are unreliable — skew, drift, and malicious manipulation. OT requires a total ordering of operations. Server-assigned timestamps give us a single authoritative clock per document, making transformation deterministic.
+
+
+🚧 What I'd Do Differently Given More Time
+1. Read-only mode for large audiences
+"Google Docs limits concurrent editors but allows unlimited viewers. Viewers don't need WebSocket connections to the Document Service — they just need a live stream of document updates. I'd implement a separate read-only path: viewers connect to stateless Read Gateway servers, which subscribe to a document's update stream via Redis pub/sub. The Document Service publishes each applied op to Redis after broadcasting to editors. This decouples viewer scale from editor scale completely — you could have 100,000 viewers on a document with 100 editors, with no impact on the editing path."
+2. Offline editing support
+"With OT, offline support is hard — you need to transform your local ops against all the ops that happened on the server while you were offline, which requires fetching the full op history since you disconnected. CRDTs handle this more elegantly. For offline support, I'd consider a hybrid: use OT for online collaborative editing, but layer a CRDT-based sync protocol for offline scenarios where clients reconnect after extended disconnections. Yjs's awareness protocol is a good reference here."
+3. Rich text beyond plain text
+"We scoped this to plain text, but real documents have structure — bold, italics, headings, lists, embedded images. The OT transformation functions become significantly more complex for structured content. The industry has largely converged on a document model like ProseMirror's schema or Quill's Delta format, where the document is a sequence of ops with attributes rather than raw characters. I'd adopt one of these proven schemas rather than inventing my own."
+4. Conflict-free presence at scale
+"Cursor positions use integer offsets into the document. When characters are inserted before a cursor, its position becomes stale — you need to transform cursor positions the same way you transform ops. This is straightforward for 100 editors but worth explicitly implementing. For very large documents, transmitting and rendering 100 cursors on every update has UI performance implications — I'd throttle cursor updates to ~100ms intervals rather than on every keystroke."
+5. Multi-region deployment
+"Our design is single-region. For global low latency, we'd want editors geographically close to their Document Service instance. Multi-region collaborative editing is extremely hard — you can't have editors in US-East and EU-West both writing to the same document with sub-100ms latency while maintaining OT's ordering guarantee. Practical approaches include: geo-routing editors to the nearest region with replication lag for reads, or accepting that inter-region collaborative editing has higher latency (which is fine — you're collaborating with someone in another continent)."
+🎯 Final Reflection
+"The core insight of this design is that Google Docs is actually two very different problems that share a storage layer:"
+"The first is a consistency problem — how do you make concurrent edits from multiple users converge to the same document? OT solves this elegantly by transforming operations relative to each other, with the Document Service as the authoritative ordering point. This is fundamentally a single-threaded problem per document — and we lean into that rather than fighting it."
+"The second is a connection scaling problem — how do you maintain millions of stateful WebSocket connections while preserving the co-location constraint that OT requires? Consistent hashing with ZooKeeper solves this by making routing deterministic — every server always knows which server owns any given document."
+"The design deliberately keeps these two concerns separate. The OT logic doesn't care how we route connections. The routing logic doesn't care how OT works. That separation of concerns is what makes the system comprehensible and maintainable as it scales."
+🎤 Interviewer:
+"Strong design overall. Thank you."
+🏁 End of Mock Interview
+
+📊 Overall Assessment
+AreaQualityNotesRequirements clarification✅ StrongIdentified two distinct challenges immediatelyCore entities✅ StrongPersistent vs. ephemeral data distinctionAPI design✅ StrongWebSocket message design, opId for idempotencyHigh-level architecture✅ StrongWrite path, read path, presence all coveredOT vs. CRDTs deep dive✅ StrongBuilt from first principles, worked examplesWebSocket scaling deep dive✅ StrongConsistent hashing, pub/sub trade-offCompaction deep dive✅ StrongOnline vs. offline, versionId CAS mechanismWrap-up & trade-offs✅ StrongClear opinions backed by reasoning
+
+💬 How did you find this one compared to the Metrics Monitoring problem?
+This one is conceptually harder — the OT/CRDT material alone trips up most candidates, and the WebSocket scaling constraint (co-location + horizontal scale) is a genuine tension that requires a non-obvious solution. Would you like to go deeper on any section, or try a different problem?
+
+Can you explain about CRDT?
+
+
+
+Great question! Let me explain CRDTs from first principles — no hand-waving, just building up the intuition step by step.
+What is a CRDT?
+CRDT = Conflict-free Replicated Data Type It's a data structure designed so that multiple users can make changes independently and concurrently — even without network connectivity — and when they eventually sync up, they always converge to the same state automatically, with no conflicts to resolve. The magic word is commutative — CRDT operations produce the same result regardless of the order they're applied.
+Why Do We Need It? The Core Problem
+Imagine two users editing the word "Hello" simultaneously, with no server in between:
+
+User A deletes H → gets "ello"
+User B inserts ! at the end → gets "Hello!" When they sync, what should the final document be?
+"ello!" ? or
+"ello" ? or
+"Hello!" ? With regular data structures, it depends entirely on who syncs last — someone's change gets silently overwritten. CRDTs solve this by making both operations always safely composable.
+The Two Key Tricks CRDTs Use for Text
+Trick 1: Stable Fractional Positions (No Integer Indexes)
+Regular text uses integer positions: character at index 0, 1, 2, 3... The problem is these shift whenever someone inserts or deletes. CRDTs assign each character a unique, stable, fractional identifier that never changes — think of it like a real number between 0 and 1.
+
+please continue
+
+
+
+Sure! To make sure I continue in the right direction — did you mean:
+
+Continue the CRDT explanation — go deeper on a specific aspect like fractional ID generation, garbage collection, or how Yjs works under the hood?
+Continue with a new system design problem — there are more problems on the Hello Interview page (Distributed Cache, YouTube, Web Crawler, etc.) and we can walk through one in the same mentor format?
+Continue with a different topic from the Google Docs design — like the read-only viewer scaling, offline editing, or rich text support that we flagged as "out of scope" in the wrap-up? Just let me know and I'll pick up from there!
+Continue the CRDT explanation
+
+
+
+Great! Let's go deeper. I'll cover the three most important advanced topics in CRDTs:
+
+Fractional ID generation in practice — how do you actually pick IDs without collisions?
+Garbage collection of tombstones — how do you reclaim memory safely?
+How Yjs works — a real production CRDT implementation
+1. Fractional ID Generation in Practice
+The Naive Problem
+In our examples we used simple decimals like 0.53 and 0.57. In reality two problems arise: Problem 1: Collisions If User A and User B both insert between 0.5 and 0.6 and both randomly pick 0.53 — they've generated the same ID for two different characters. The document is now ambiguous. Problem 2: Precision exhaustion If users repeatedly insert between the same two characters, the IDs get longer and longer:
+
+0.5 → 0.51 → 0.511 → 0.5111 → 0.51111...
+After thousands of inserts in the same spot, IDs become arbitrarily long — consuming huge memory and slowing down sorting.
+How Real Implementations Solve This
+Solution to collisions: Tie-breaking with Site ID Each client (site) is assigned a globally unique site ID (e.g., a UUID) when they connect. Every fractional position is actually a tuple:
+
+Position = (fractional_number, site_id, sequence_number)
+Comparison is lexicographic: compare fractional number first, then site_id, then sequence_number. Since site IDs are unique, two clients can independently pick the same fractional number and still produce a total, unambiguous ordering.
+
+User A inserts at: (0.53, "site-A", 42)
+User B inserts at: (0.53, "site-B", 17)
+Ordering: site-A < site-B alphabetically
+→ User A's character comes before User B's
+→ Both clients agree on this ordering ✅
+Solution to precision exhaustion: Tree-based position allocation (LSEQ) Instead of simple decimals, production CRDTs use a tree structure to allocate positions. The document is a tree where:
+
+Each level of the tree has a fixed number of slots (e.g., 32 slots at level 1, 1024 at level 2, etc.)
+A position is a path from root to leaf: e.g., [15, 7, 22] means "slot 15 at level 1, slot 7 at level 2, slot 22 at level 3"
+To insert between two positions, go one level deeper and pick a slot in between
+Level 1:  [0 ............ 15 ............. 31]
+                           ↓
+Level 2:          [0 .... 7 .......... 31]
+                           ↓
+Level 3:      [0 .. 3 .. 7 .. 14 .. 31]
+This way, positions don't grow unboundedly — they grow logarithmically as edits accumulate. And the tree structure makes it easy to generate positions between any two existing ones. LSEQ (Linked Sequence) is the algorithm most commonly used in practice. It alternates between two strategies at each tree level:
+
+Boundary+: allocate near the left boundary (good for left-to-right typing)
+Boundary-: allocate near the right boundary (good for right-to-left typing) This heuristic dramatically reduces ID length for common editing patterns.
+2. Garbage Collection of Tombstones
+The Problem
+Tombstones accumulate forever. In a long-lived document:
+
+User types 100,000 characters over its lifetime
+User deletes 80,000 of them
+Document displays only 20,000 characters
+But CRDT stores all 100,000 entries (80,000 as tombstones + 20,000 visible) This is a real memory and performance problem in production systems.
+The Safe Garbage Collection Condition
+A tombstone can only be removed when we are certain every client that will ever interact with this document has already seen and applied the deletion. Why? Consider this scenario:
+
+User A deletes character H (0.1) → tombstone created
+User B is offline, hasn't seen the deletion yet
+Someone garbage collects the tombstone → H (0.1) no longer exists in the data structure
+User B comes online and tries to insert between H (0.1) and e (0.2) → position 0.1 no longer exists → insert is lost or corrupted So garbage collection requires a form of global consensus about who has seen what.
+How It's Done in Practice
+Method 1: Version Vectors Each client maintains a version vector — a map of {siteId → last_sequence_number_seen}:
+
+User A's version vector: { "site-A": 42, "site-B": 38, "site-C": 15 }
+This says: "I've seen all ops from site-A up to #42, from site-B up to #38, etc." A tombstone for operation (site-B, seq=30) can be garbage collected when all currently connected clients have a version vector showing site-B ≥ 30. This means everyone has seen that deletion. The server (or peers in a P2P system) periodically broadcasts their version vectors. When all vectors confirm they've seen a deletion, the tombstone is purged. Method 2: Epoch-based GC (used by Yjs) Yjs uses a simpler approach:
+
+The server periodically takes a snapshot of the current document state (visible text only, no tombstones)
+This snapshot is assigned an epoch number
+New clients joining after this epoch load from the snapshot, not from scratch
+Tombstones from before the snapshot epoch are safe to delete — no new client will ever need to reference them
+Epoch 1: [snapshot of document at t=0]
+    ↓ new ops accumulate...
+Epoch 2: [snapshot of document at t=1hr]
+    → tombstones from Epoch 1 can now be GC'd
+This is elegant — it's the same compaction concept we discussed in the Google Docs design, applied to CRDTs. Method 3: Causal Stability (academic approach) An operation is causally stable when it's been seen by all sites and no future operation can possibly causally precede it. Once an operation is causally stable, its tombstone is safe to collect. This is provably correct but requires sophisticated vector clock tracking.
+3. How Yjs Works — A Real Production CRDT
+Yjs is the most widely used open-source CRDT library. It's used in production by many collaborative tools. Let me explain its key design choices.
+Yjs's Core Data Structure: Double-Linked List of Items
+Yjs represents a document as a doubly linked list of Item objects:
+
+Item {
+  id:        (clientID, clock)    ← unique ID
+  content:   string               ← the character(s)
+  deleted:   boolean              ← tombstone flag
+  left:      Item                 ← left neighbor at time of insertion
+  right:     Item                 ← right neighbor at time of insertion
+  origin:    Item                 ← left neighbor when this item was inserted
+}
+The origin field is crucial — it records what was to the left of this item at the time it was inserted, not the current left neighbor. This is how Yjs resolves concurrent insertions at the same position deterministically.
+Yjs's Insertion Algorithm (YATA)
+When User A inserts character X between items L and R:
+
+Item X {
+  origin: L,    ← what was to my left when I was created
+  right:  R     ← what was to my right when I was created
+}
+When this op arrives at another client, Yjs finds where to place X using this rule:
+
+Start from L.right (the item immediately right of X's left origin)
+Walk right through items until finding the correct position
+The rule for ordering concurrent insertions at the same spot:
+Items with an origin further to the left go further right
+If origins are equal, break ties by clientID (consistent across all clients) This algorithm — called YATA (Yet Another Transformation Algorithm) — guarantees that all clients place the item in the same position, even if they receive ops in different orders. No server needed for ordering.
+Yjs's Awareness Protocol
+Beyond document content, Yjs has a separate lightweight protocol for ephemeral state — cursor positions, user presence, selection ranges. This is kept completely separate from the document CRDT because:
+
+Cursor state doesn't need to be persisted
+It doesn't need tombstones or version vectors
+It can be lossy — missing one cursor update is fine Awareness uses a simple last-write-wins map per client:
+{
+  "client-A": { cursor: 42, name: "Alice", color: "#FF5733", timestamp: 1640000001 },
+  "client-B": { cursor: 17, name: "Bob",   color: "#33FF57", timestamp: 1640000002 }
+}
+Each client owns its own entry and broadcasts updates when its cursor moves. On disconnect, its entry is removed. Conflicts are impossible — each client only writes to its own entry. This is exactly the in-memory cursor map we designed in the Google Docs architecture — Yjs just formalizes it as part of the protocol.
+Yjs's Update Encoding
+Yjs is extremely efficient on the wire. Instead of sending individual operations, it:
+
+Batches operations — multiple inserts in sequence are merged into a single Item with multi-character content
+Encodes updates as binary using a compact variable-length integer encoding
+Computes diffs — Y.encodeStateAsUpdate(doc, remoteStateVector) produces only the ops the remote client hasn't seen yet, not the full document A typical collaborative session generates only a few hundred bytes per second per user — very efficient.
+Yjs's State Vector
+To synchronize two clients efficiently, Yjs uses a state vector:
+
+StateVector = { clientID → highest_clock_seen }
+When two clients connect (or reconnect after offline), they exchange state vectors. Each can immediately compute exactly what ops the other is missing and send only those — no full sync needed.
+
+Client A state: { A: 50, B: 30 }
+Client B state: { A: 45, B: 35 }
+→ A needs to send ops: B[31..35]
+→ B needs to send ops: A[46..50]
+This makes reconnection after offline periods extremely efficient — only the missed ops are transferred, not the whole document.
+Putting It All Together — CRDT Mental Model
+Think of a CRDT document like a cosmic ledger:
+
+Every character ever typed is recorded forever (with tombstones for deleted ones)
+Every character has a unique, stable address in the universe (fractional ID)
+Any two clients can independently make changes and always agree on the final state by sorting characters by their addresses
+The ledger grows over time, but GC periodically prunes entries that everyone has acknowledged The beauty is that no coordination is needed — the data structure itself encodes all the information needed to resolve conflicts. It's a fundamentally different philosophy from OT: instead of transforming operations to fit a shared ordering, you design the data structure so ordering doesn't matter.
+Summary Table: CRDT Internals
+Concept	Problem it solves	How
+Fractional IDs (LSEQ)	Stable positions despite inserts/deletes	Tree-based position allocation
+Site ID tie-breaking	Collision-free concurrent inserts	Lexicographic comparison of (position, siteID)
+Tombstones	Safe concurrent deletes	Never remove, just mark deleted
+Version vectors	Know what each client has seen	Map of {siteId → last_seq_seen}
+Garbage collection	Reclaim tombstone memory	Delete tombstones seen by all clients
+Yjs YATA algorithm	Deterministic concurrent insert ordering	Origin-based placement rule
+Yjs awareness	Ephemeral cursor/presence	Last-write-wins per-client map
+Yjs state vectors	Efficient reconnect sync	Exchange vectors, send only missing ops
+Would you like to go even deeper on any of these — like the LSEQ tree algorithm in more detail, how vector clocks work, or how Yjs handles a specific edge case? Or shall we move on to a new system design problem?
