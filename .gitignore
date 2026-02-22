@@ -1,0 +1,3 @@
+# Generated audio files — run scripts/generate_audio.py to recreate
+*.wav
+*.mp3
