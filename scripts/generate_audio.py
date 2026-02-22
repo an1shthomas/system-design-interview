@@ -45,7 +45,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 KOKORO_INTERVIEWER_VOICE    = "af_jessica"             # Female, American English, grade A-
-KOKORO_CANDIDATE_VOICE      = "am_adam"           # Male,   American English, grade B
+KOKORO_CANDIDATE_VOICE      = "am_michael"           # Male,   American English, grade B
 KOKORO_SAMPLE_RATE          = 24000
 
 ELEVENLABS_INTERVIEWER_VOICE = "21m00Tcm4TlvDq8ikWAM"  # Rachel
@@ -68,10 +68,28 @@ def parse_dialogue(md_text: str) -> list[tuple[str, str]]:
     current_lines: list[str] = []
     in_code_block = False
 
+    def join_lines(lines: list[str]) -> str:
+        """Join lines into a single string, adding a period between lines that
+        don't already end with sentence-ending punctuation. This prevents list
+        items from running together (e.g. '...ZooKeeper 2. It takes...')."""
+        result = ""
+        for line in lines:
+            if not result:
+                result = line
+            elif result.endswith((".", "!", "?", ":", ",")):
+                result += " " + line
+            else:
+                result += ". " + line
+        return result
+
+    def strip_list_marker(line: str) -> str:
+        """Remove leading bullet or numbered list markers from a single line."""
+        return re.sub(r"^(\d+[.)]\s+|[-*+]\s+)", "", line)
+
     def flush():
         nonlocal current_speaker, current_lines
         if current_speaker and current_lines:
-            text = clean_text(" ".join(current_lines))
+            text = clean_text(join_lines(current_lines))
             if text.strip():
                 segments.append((current_speaker, text))
         current_speaker = None
@@ -105,7 +123,7 @@ def parse_dialogue(md_text: str) -> list[tuple[str, str]]:
             current_lines = [text] if text else []
             continue
         if current_speaker:
-            stripped = line.strip()
+            stripped = strip_list_marker(line.strip())
             if stripped:
                 current_lines.append(stripped)
 
@@ -120,8 +138,6 @@ def clean_text(text: str) -> str:
     text = re.sub(r"\*(.+?)\*", r"\1", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
     text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text)
-    text = re.sub(r"^[-*+]\s+", "", text, flags=re.MULTILINE)
-    text = re.sub(r"^\d+\.\s+", "", text, flags=re.MULTILINE)
     text = re.sub(r"_(.+?)_", r"\1", text)
     text = text.replace("\u201c", '"').replace("\u201d", '"')
     text = text.replace("\u2018", "'").replace("\u2019", "'")
