@@ -5,29 +5,32 @@
 #   "kokoro>=0.9.4",
 #   "soundfile>=0.12.1",
 #   "numpy>=1.24.0",
+#   "elevenlabs>=1.0.0",
+#   "pydub>=0.25.0",
+#   "audioop-lts>=0.2.1",
 # ]
 # ///
 """
-Generate interview audio from notes.md using Kokoro TTS (local, no API key).
+Generate interview audio from notes.md using Kokoro TTS (local) or ElevenLabs.
 
 Parses the 🎤 Interviewer / 👨‍💻 Candidate dialogue format and generates
-a single WAV file with different voices for each speaker.
+a single audio file with different voices for each speaker.
 
 Usage:
-    uv run scripts/generate_audio.py <path/to/notes.md>
-    uv run scripts/generate_audio.py google-docs/notes.md
-    uv run scripts/generate_audio.py google-docs/notes.md --output audio/google-docs.wav
+    uv run scripts/generate_audio.py <notes.md>                          # Kokoro (default)
+    uv run scripts/generate_audio.py <notes.md> --backend elevenlabs     # ElevenLabs
 
-Requirements:
-    uv handles Python dependencies automatically via inline script metadata.
-    Also requires espeak-ng: sudo pacman -S espeak-ng
+Kokoro (local, free, no API key):
+    Requires: sudo pacman -S espeak-ng
+    Output:   WAV file
+    Voices:   INTERVIEWER_VOICE / CANDIDATE_VOICE (default: af_bella / am_michael)
+    List:     --list-voices
 
-Voices (American English):
-    Interviewer: af_bella  (female, grade A-)
-    Candidate:   am_michael (male,   grade B)
-
-    Override via env vars: INTERVIEWER_VOICE and CANDIDATE_VOICE
-    List all voices: --list-voices
+ElevenLabs (cloud, paid):
+    Requires: ELEVENLABS_API_KEY env var
+    Output:   MP3 file
+    Voices:   INTERVIEWER_VOICE / CANDIDATE_VOICE (default: Rachel / Adam voice IDs)
+    List:     --list-voices
 """
 
 import argparse
@@ -36,29 +39,21 @@ import re
 import sys
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Default Kokoro voice IDs
-# Full list: https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md
-# ---------------------------------------------------------------------------
-DEFAULT_INTERVIEWER_VOICE = "af_bella"   # Female, American English, grade A-
-DEFAULT_CANDIDATE_VOICE   = "am_michael" # Male,   American English, grade B
 
-SAMPLE_RATE = 24000  # Kokoro outputs at 24kHz
+# ---------------------------------------------------------------------------
+# Voice defaults
+# ---------------------------------------------------------------------------
 
-ALL_VOICES = [
-    # American English
-    "af_heart", "af_bella", "af_nicole", "af_aoede", "af_kore", "af_sarah",
-    "af_alloy", "af_nova", "af_sky", "af_jessica", "af_river",
-    "am_michael", "am_fenrir", "am_puck", "am_echo", "am_eric",
-    "am_liam", "am_onyx", "am_adam",
-    # British English
-    "bf_emma", "bf_alice", "bf_isabella", "bf_lily",
-    "bm_george", "bm_fable", "bm_daniel", "bm_lewis",
-]
+KOKORO_INTERVIEWER_VOICE    = "af_bella"             # Female, American English, grade A-
+KOKORO_CANDIDATE_VOICE      = "am_michael"           # Male,   American English, grade B
+KOKORO_SAMPLE_RATE          = 24000
+
+ELEVENLABS_INTERVIEWER_VOICE = "21m00Tcm4TlvDq8ikWAM"  # Rachel
+ELEVENLABS_CANDIDATE_VOICE   = "pNInz6obpgDQGcFmaJgB"  # Adam
 
 
 # ---------------------------------------------------------------------------
-# Markdown parsing
+# Markdown parsing (shared)
 # ---------------------------------------------------------------------------
 
 def parse_dialogue(md_text: str) -> list[tuple[str, str]]:
@@ -83,48 +78,32 @@ def parse_dialogue(md_text: str) -> list[tuple[str, str]]:
         current_lines = []
 
     for line in md_text.splitlines():
-        # Track fenced code blocks — skip their contents
         if line.strip().startswith("```"):
             in_code_block = not in_code_block
             continue
         if in_code_block:
             continue
-
-        # Skip callout boxes (✅ staff-level sections, blockquotes)
         if line.startswith(">"):
             continue
-
-        # Skip tables
         if line.strip().startswith("|"):
             continue
-
-        # Skip horizontal rules
         if re.match(r"^-{3,}$", line.strip()):
             continue
-
-        # Section headers — reset speaker context
         if line.startswith("#"):
             flush()
             continue
-
-        # --- Interviewer speaker marker ---
         if "🎤" in line and "Interviewer" in line:
             flush()
             current_speaker = "interviewer"
             text = re.sub(r".*🎤\s*\*\*Interviewer[^:]*:\*\*\s*", "", line).strip()
             current_lines = [text] if text else []
             continue
-
-        # --- Candidate speaker marker ---
-        # Handles both "👨‍💻 **Candidate:**" and "👨‍💻 **Staff Engineer (candidate):**"
         if ("👨" in line or "🧑" in line) and ("Candidate" in line or "Staff Engineer" in line):
             flush()
             current_speaker = "candidate"
             text = re.sub(r".*👨[^\s*]*\s*\*\*[^:]+:\*\*\s*", "", line).strip()
             current_lines = [text] if text else []
             continue
-
-        # Accumulate lines for the current speaker
         if current_speaker:
             stripped = line.strip()
             if stripped:
@@ -136,120 +115,60 @@ def parse_dialogue(md_text: str) -> list[tuple[str, str]]:
 
 def clean_text(text: str) -> str:
     """Strip markdown formatting so text sounds natural when read aloud."""
-    # Bold and italic
     text = re.sub(r"\*\*\*(.+?)\*\*\*", r"\1", text)
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
     text = re.sub(r"\*(.+?)\*", r"\1", text)
-    # Inline code
     text = re.sub(r"`([^`]+)`", r"\1", text)
-    # Markdown links
     text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text)
-    # Bullet/numbered list markers
     text = re.sub(r"^[-*+]\s+", "", text, flags=re.MULTILINE)
     text = re.sub(r"^\d+\.\s+", "", text, flags=re.MULTILINE)
-    # Underscores used for emphasis
     text = re.sub(r"_(.+?)_", r"\1", text)
-    # Curly quotes → straight
     text = text.replace("\u201c", '"').replace("\u201d", '"')
     text = text.replace("\u2018", "'").replace("\u2019", "'")
-    # Collapse whitespace
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 
 # ---------------------------------------------------------------------------
-# Kokoro TTS
+# Kokoro backend
 # ---------------------------------------------------------------------------
 
-def tts(pipeline, voice: str, text: str):
-    """Generate audio for text using Kokoro. Returns a numpy float32 array."""
+def kokoro_list_voices():
+    print("American English:")
+    print("  Female (af_*): af_heart(A) af_bella(A-) af_nicole(B-) af_aoede af_kore af_sarah af_alloy af_nova af_sky")
+    print("  Male   (am_*): am_michael(B) am_fenrir(C+) am_puck(C+) am_echo am_eric am_liam am_onyx am_adam")
+    print("British English:")
+    print("  Female (bf_*): bf_emma(B-) bf_alice bf_isabella bf_lily")
+    print("  Male   (bm_*): bm_george bm_fable bm_daniel bm_lewis")
+    print("\nFull grades: https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md")
+
+
+def kokoro_generate(notes_path: Path, output_path: Path, interviewer_voice: str,
+                    candidate_voice: str, pause_ms: int):
     import numpy as np
-    chunks = [audio for _, _, audio in pipeline(text, voice=voice)]
-    return np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
-
-
-def combine_clips(clips, pause_ms: int = 600):
-    """Concatenate numpy audio arrays with silence between each clip."""
-    import numpy as np
-    silence = np.zeros(int(SAMPLE_RATE * pause_ms / 1000), dtype=np.float32)
-    parts = []
-    for clip in clips:
-        parts.append(clip)
-        parts.append(silence)
-    return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main():
-    parser = argparse.ArgumentParser(description="Generate interview audio from notes.md using Kokoro TTS")
-    parser.add_argument("notes", help="Path to notes.md file")
-    parser.add_argument("--output", "-o", help="Output WAV path (default: <notes_dir>/<dirname>.wav)")
-    parser.add_argument("--pause", type=int, default=600, help="Pause between speakers in ms (default: 600)")
-    parser.add_argument("--list-voices", action="store_true", help="Print available voices and exit")
-    args = parser.parse_args()
-
-    if args.list_voices:
-        print("Available Kokoro voices (American English):")
-        print("  Female: af_heart af_bella af_nicole af_aoede af_kore af_sarah af_alloy af_nova af_sky")
-        print("  Male:   am_michael am_fenrir am_puck am_echo am_eric am_liam am_onyx am_adam")
-        print("\nBritish English:")
-        print("  Female: bf_emma bf_alice bf_isabella bf_lily")
-        print("  Male:   bm_george bm_fable bm_daniel bm_lewis")
-        print("\nFull quality grades: https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md")
-        return
-
-    # --- Voice selection ---
-    interviewer_voice = os.environ.get("INTERVIEWER_VOICE", DEFAULT_INTERVIEWER_VOICE)
-    candidate_voice   = os.environ.get("CANDIDATE_VOICE",   DEFAULT_CANDIDATE_VOICE)
-
-    # --- Parse notes.md ---
-    notes_path = Path(args.notes)
-    if not notes_path.exists():
-        print(f"Error: {notes_path} not found.", file=sys.stderr)
-        sys.exit(1)
+    import soundfile as sf
+    from kokoro import KPipeline
 
     md_text = notes_path.read_text(encoding="utf-8")
     segments = parse_dialogue(md_text)
-
     if not segments:
-        print("No dialogue segments found. Check the notes.md format.", file=sys.stderr)
+        print("No dialogue segments found.", file=sys.stderr)
         sys.exit(1)
 
     print(f"Found {len(segments)} dialogue segments.")
-
-    # --- Output path ---
-    if args.output:
-        output_path = Path(args.output)
-    else:
-        output_path = notes_path.parent / f"{notes_path.parent.name}.wav"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # --- Load Kokoro (downloads model on first run, ~300MB) ---
     print("Loading Kokoro model…")
-    try:
-        from kokoro import KPipeline
-    except ImportError:
-        print("Error: kokoro not installed. Run: uv run scripts/generate_audio.py", file=sys.stderr)
-        sys.exit(1)
+    pipeline = KPipeline(lang_code='a')
+    print(f"Interviewer: {interviewer_voice}  |  Candidate: {candidate_voice}\n")
 
-    pipeline = KPipeline(lang_code='a')  # 'a' = American English
-    print(f"Interviewer voice: {interviewer_voice}  |  Candidate voice: {candidate_voice}\n")
-
-    # --- Generate audio ---
-    import numpy as np
     clips = []
     for i, (speaker, text) in enumerate(segments, 1):
         voice = interviewer_voice if speaker == "interviewer" else candidate_voice
         label = "Interviewer" if speaker == "interviewer" else "Candidate"
-        preview = text[:70] + ("…" if len(text) > 70 else "")
-        print(f"[{i}/{len(segments)}] {label}: {preview}")
-
+        print(f"[{i}/{len(segments)}] {label}: {text[:70]}{'…' if len(text) > 70 else ''}")
         try:
-            audio = tts(pipeline, voice, text)
-            clips.append(audio)
+            chunks = [audio for _, _, audio in pipeline(text, voice=voice)]
+            if chunks:
+                clips.append(np.concatenate(chunks))
         except Exception as e:
             print(f"  Warning: TTS failed for segment {i}: {e}", file=sys.stderr)
 
@@ -257,14 +176,134 @@ def main():
         print("Error: No audio clips generated.", file=sys.stderr)
         sys.exit(1)
 
-    # --- Combine and save ---
     print(f"\nCombining {len(clips)} clips…")
-    combined = combine_clips(clips, pause_ms=args.pause)
+    silence = np.zeros(int(KOKORO_SAMPLE_RATE * pause_ms / 1000), dtype=np.float32)
+    combined = np.concatenate([x for clip in clips for x in (clip, silence)])
 
-    import soundfile as sf
-    sf.write(str(output_path), combined, SAMPLE_RATE)
-    duration_min = len(combined) / SAMPLE_RATE / 60
-    print(f"Saved: {output_path}  ({duration_min:.1f} min)")
+    sf.write(str(output_path), combined, KOKORO_SAMPLE_RATE)
+    print(f"Saved: {output_path}  ({len(combined) / KOKORO_SAMPLE_RATE / 60:.1f} min)")
+
+
+# ---------------------------------------------------------------------------
+# ElevenLabs backend
+# ---------------------------------------------------------------------------
+
+def elevenlabs_list_voices(client):
+    voices = client.voices.get_all()
+    print(f"{'Name':<30} {'Voice ID'}")
+    print("-" * 60)
+    for v in sorted(voices.voices, key=lambda x: x.name):
+        print(f"{v.name:<30} {v.voice_id}")
+
+
+def elevenlabs_generate(notes_path: Path, output_path: Path, interviewer_voice: str,
+                        candidate_voice: str, pause_ms: int, client, model_id: str):
+    import io
+    import time
+    from pydub import AudioSegment
+
+    md_text = notes_path.read_text(encoding="utf-8")
+    segments = parse_dialogue(md_text)
+    if not segments:
+        print("No dialogue segments found.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Found {len(segments)} dialogue segments.")
+    print(f"Interviewer: {interviewer_voice}  |  Candidate: {candidate_voice}\n")
+
+    clips = []
+    for i, (speaker, text) in enumerate(segments, 1):
+        voice_id = interviewer_voice if speaker == "interviewer" else candidate_voice
+        label = "Interviewer" if speaker == "interviewer" else "Candidate"
+        print(f"[{i}/{len(segments)}] {label}: {text[:70]}{'…' if len(text) > 70 else ''}")
+        try:
+            audio_bytes = b"".join(client.text_to_speech.convert(
+                voice_id=voice_id, text=text, model_id=model_id,
+                output_format="mp3_44100_128",
+            ))
+            clips.append(audio_bytes)
+        except Exception as e:
+            print(f"  Warning: TTS failed for segment {i}: {e}", file=sys.stderr)
+        if i < len(segments):
+            time.sleep(0.3)
+
+    if not clips:
+        print("Error: No audio clips generated.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"\nCombining {len(clips)} clips…")
+    silence = AudioSegment.silent(duration=pause_ms)
+    combined = AudioSegment.empty()
+    for clip_bytes in clips:
+        combined += AudioSegment.from_mp3(io.BytesIO(clip_bytes)) + silence
+
+    buf = io.BytesIO()
+    combined.export(buf, format="mp3")
+    output_path.write_bytes(buf.getvalue())
+    print(f"Saved: {output_path}  ({combined.duration_seconds / 60:.1f} min)")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate interview audio from notes.md")
+    parser.add_argument("notes", help="Path to notes.md file")
+    parser.add_argument("--backend", choices=["kokoro", "elevenlabs"], default="kokoro",
+                        help="TTS backend (default: kokoro)")
+    parser.add_argument("--output", "-o", help="Output file path (default: <notes_dir>/<dirname>.wav or .mp3)")
+    parser.add_argument("--pause", type=int, default=600, help="Pause between speakers in ms (default: 600)")
+    parser.add_argument("--model", default="eleven_turbo_v2_5", help="ElevenLabs model ID (ignored for kokoro)")
+    parser.add_argument("--list-voices", action="store_true", help="Print available voices and exit")
+    args = parser.parse_args()
+
+    notes_path = Path(args.notes)
+
+    interviewer_voice = os.environ.get("INTERVIEWER_VOICE")
+    candidate_voice   = os.environ.get("CANDIDATE_VOICE")
+
+    # --- Kokoro ---
+    if args.backend == "kokoro":
+        if args.list_voices:
+            kokoro_list_voices()
+            return
+
+        iv = interviewer_voice or KOKORO_INTERVIEWER_VOICE
+        cv = candidate_voice   or KOKORO_CANDIDATE_VOICE
+
+        if args.output:
+            output_path = Path(args.output)
+        else:
+            output_path = notes_path.parent / f"{notes_path.parent.name}.wav"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        kokoro_generate(notes_path, output_path, iv, cv, args.pause)
+
+    # --- ElevenLabs ---
+    elif args.backend == "elevenlabs":
+        api_key = os.environ.get("ELEVENLABS_API_KEY")
+        if not api_key:
+            print("Error: ELEVENLABS_API_KEY environment variable not set.", file=sys.stderr)
+            sys.exit(1)
+
+        from elevenlabs.client import ElevenLabs
+        client = ElevenLabs(api_key=api_key)
+
+        if args.list_voices:
+            elevenlabs_list_voices(client)
+            return
+
+        iv = interviewer_voice or ELEVENLABS_INTERVIEWER_VOICE
+        cv = candidate_voice   or ELEVENLABS_CANDIDATE_VOICE
+
+        if args.output:
+            output_path = Path(args.output)
+        else:
+            output_path = notes_path.parent / f"{notes_path.parent.name}.mp3"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        elevenlabs_generate(notes_path, output_path, iv, cv, args.pause, client, args.model)
 
 
 if __name__ == "__main__":
